@@ -1,0 +1,311 @@
+#include <WiFi.h>
+#include "esp_camera.h"
+#include <WiFiUdp.h>
+
+/*
+|--------------------------------------------------------------------------
+| WIFI
+|--------------------------------------------------------------------------
+*/
+const char* ssid = "FPT-Telecom-910A";
+const char* password = "1234567809";
+
+/*
+|--------------------------------------------------------------------------
+| SERVER
+|--------------------------------------------------------------------------
+*/
+const char* serverIp = "192.168.0.101";
+const uint16_t videoPort = 5000;
+const uint16_t controlPort = 6000;
+
+/*
+|--------------------------------------------------------------------------
+| CAMERA ID
+|--------------------------------------------------------------------------
+*/
+uint8_t cameraId = 1;
+
+/*
+|--------------------------------------------------------------------------
+| UDP
+|--------------------------------------------------------------------------
+*/
+WiFiUDP videoUdp;
+WiFiUDP controlUdp;
+
+/*
+|--------------------------------------------------------------------------
+| STREAM STATE
+|--------------------------------------------------------------------------
+*/
+bool streaming = false;
+
+/*
+|--------------------------------------------------------------------------
+| FRAME
+|--------------------------------------------------------------------------
+*/
+uint16_t frameId = 0;
+const int CHUNK_SIZE = 1400;
+
+/*
+|--------------------------------------------------------------------------
+| CAMERA PINS (AI THINKER)
+|--------------------------------------------------------------------------
+*/
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+/*
+|--------------------------------------------------------------------------
+| UDP HEADER
+|--------------------------------------------------------------------------
+*/
+struct PacketHeader {
+  uint8_t cameraId;
+  uint16_t frameId;
+  uint16_t totalChunks;
+  uint16_t chunkIndex;
+} __attribute__((packed));
+
+/*
+|--------------------------------------------------------------------------
+| WIFI
+|--------------------------------------------------------------------------
+*/
+void connectWiFi() {
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(ssid, password);
+
+  Serial.print("[WIFI] Connecting");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("[WIFI] Connected");
+  Serial.print("[WIFI] IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+/*
+|--------------------------------------------------------------------------
+| CAMERA INIT
+|--------------------------------------------------------------------------
+*/
+bool initCamera() {
+
+  camera_config_t config;
+
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+
+  config.xclk_freq_hz = 30000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  config.frame_size = FRAMESIZE_HVGA;
+  config.jpeg_quality = 15;
+  config.fb_count = 2;
+
+  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+
+  esp_err_t err = esp_camera_init(&config);
+
+  if (err != ESP_OK) {
+    Serial.printf("[CAM] Init failed: 0x%x\n", err);
+    return false;
+  }
+
+  Serial.println("[CAM] Initialized OK");
+  return true;
+}
+
+/*
+|--------------------------------------------------------------------------
+| SEND FRAME (DEBUG FULL)
+|--------------------------------------------------------------------------
+*/
+void sendFrame(camera_fb_t* fb) {
+
+  if (!fb) {
+    // Serial.println("[FRAME] NULL fb");
+    return;
+  }
+
+  Serial.printf("[FRAME] size = %d bytes\n", fb->len);
+
+  uint16_t totalChunks =
+    (fb->len + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+  // Serial.printf("[FRAME] chunks = %d\n", totalChunks);
+
+  for (uint16_t chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+
+    int offset = chunkIndex * CHUNK_SIZE;
+
+    int payloadSize =
+      min(CHUNK_SIZE, (int)(fb->len - offset));
+
+    // Serial.printf("[FRAME] chunk %d/%d offset=%d size=%d\n",
+    //   chunkIndex + 1,
+    //   totalChunks,
+    //   offset,
+    //   payloadSize
+    // );
+
+    PacketHeader header;
+    header.cameraId = cameraId;
+    header.frameId = htons(frameId);
+    header.totalChunks = htons(totalChunks);
+    header.chunkIndex = htons(chunkIndex);
+
+    if (!videoUdp.beginPacket(serverIp, videoPort)) {
+      Serial.println("[UDP] beginPacket FAILED");
+      continue;
+    }
+
+    videoUdp.write((uint8_t*)&header, sizeof(header));
+    videoUdp.write(fb->buf + offset, payloadSize);
+
+    if (!videoUdp.endPacket()) {
+      Serial.println("[UDP] endPacket FAILED");
+    }
+
+    // Serial.printf("[UDP] sent header+data OK\n");
+  }
+
+  // Serial.println("[FRAME] DONE");
+
+  delay(1);
+  frameId++;
+}
+
+/*
+|--------------------------------------------------------------------------
+| CONTROL UDP
+|--------------------------------------------------------------------------
+*/
+void checkControl() {
+
+  int packetSize = controlUdp.parsePacket();
+  if (!packetSize) return;
+
+  char buffer[64];
+
+  int len = controlUdp.read(buffer, sizeof(buffer) - 1);
+  if (len <= 0) return;
+
+  buffer[len] = 0;
+
+  String cmd = String(buffer);
+  cmd.trim();
+
+  Serial.printf("[CONTROL] %s\n", cmd.c_str());
+
+  if (cmd == "START") {
+    streaming = true;
+    Serial.println("[CONTROL] STREAM START");
+  }
+
+  if (cmd == "STOP") {
+    streaming = false;
+    Serial.println("[CONTROL] STREAM STOP");
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| SETUP
+|--------------------------------------------------------------------------
+*/
+void setup() {
+
+  Serial.begin(115200);
+  Serial.println();
+
+  if (!initCamera()) {
+    while (true) delay(1000);
+  }
+
+  connectWiFi();
+
+  controlUdp.begin(controlPort);
+
+  Serial.println("[SYSTEM] READY");
+}
+
+/*
+|--------------------------------------------------------------------------
+| LOOP
+|--------------------------------------------------------------------------
+*/
+void loop() {
+
+  checkControl();
+
+  // Serial.printf("[LOOP] streaming=%d\n", streaming);
+
+  if (!streaming) {
+    delay(100);
+    return;
+  }
+
+  // Serial.println("[CAM] capture...");
+
+  camera_fb_t* fb = esp_camera_fb_get();
+
+  if (!fb) {
+    Serial.println("[CAM] FAIL");
+    delay(100);
+    return;
+  }
+
+  Serial.println("[CAM] OK");
+
+  sendFrame(fb);
+
+  esp_camera_fb_return(fb);
+}

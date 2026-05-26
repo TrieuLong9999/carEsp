@@ -1,0 +1,670 @@
+# Spring Boot + ESP32-CAM Multi Camera Streaming
+
+Mục tiêu:
+
+* ESP32 gửi UDP có `cameraId`
+* Backend Spring Boot nhận frame
+* WebSocket stream theo từng camera
+* UI nhập cameraId để xem camera tương ứng
+
+---
+
+# Kiến trúc
+
+```text
+ESP32-CAM
+   ↓ UDP
+Spring Boot UDP Receiver
+   ↓
+Ghép frame theo cameraId
+   ↓
+WebSocket theo cameraId
+   ↓
+Browser chọn camera để xem
+```
+
+---
+
+# pom.xml
+
+```xml
+<dependencies>
+
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-websocket</artifactId>
+    </dependency>
+
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+
+</dependencies>
+```
+
+---
+
+# Cấu trúc project
+
+```text
+src/main/java/com/example/camera
+│
+├── CameraApplication.java
+│
+├── udp
+│   ├── FrameBuffer.java
+│   ├── PacketHeader.java
+│   └── UdpVideoServer.java
+│
+├── ws
+│   ├── VideoWebSocketHandler.java
+│   └── WebSocketConfig.java
+│
+└── web
+    └── VideoController.java
+```
+
+---
+
+# CameraApplication.java
+
+```java
+package com.example.camera;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class CameraApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(CameraApplication.class, args);
+    }
+}
+```
+
+---
+
+# PacketHeader.java
+
+```java
+package com.example.camera.udp;
+
+import lombok.Data;
+
+@Data
+public class PacketHeader {
+
+    private int cameraId;
+
+    private int frameId;
+
+    private int totalChunks;
+
+    private int chunkIndex;
+}
+```
+
+---
+
+# FrameBuffer.java
+
+```java
+package com.example.camera.udp;
+
+import java.io.ByteArrayOutputStream;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class FrameBuffer {
+
+    public int totalChunks;
+
+    public long lastUpdate;
+
+    public Map<Integer, byte[]> chunks =
+            new ConcurrentHashMap<>();
+
+    public boolean isComplete() {
+        return chunks.size() == totalChunks;
+    }
+
+    public byte[] buildFrame() {
+
+        try {
+
+            ByteArrayOutputStream out =
+                    new ByteArrayOutputStream();
+
+            for (int i = 0; i < totalChunks; i++) {
+
+                byte[] chunk = chunks.get(i);
+
+                if (chunk == null) {
+                    return null;
+                }
+
+                out.write(chunk);
+            }
+
+            return out.toByteArray();
+
+        } catch (Exception e) {
+            return null;
+        }
+    }
+}
+```
+
+---
+
+# VideoWebSocketHandler.java
+
+```java
+package com.example.camera.ws;
+
+import org.springframework.stereotype.Component;
+import org.springframework.web.socket.BinaryMessage;
+import org.springframework.web.socket.TextMessage;
+import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.handler.BinaryWebSocketHandler;
+
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Component
+public class VideoWebSocketHandler extends BinaryWebSocketHandler {
+
+    private final Map<Integer, Set<WebSocketSession>> cameraSessions =
+            new ConcurrentHashMap<>();
+
+    @Override
+    public void afterConnectionEstablished(WebSocketSession session) {
+    }
+
+    @Override
+    protected void handleTextMessage(
+            WebSocketSession session,
+            TextMessage message
+    ) throws Exception {
+
+        int cameraId = Integer.parseInt(message.getPayload());
+
+        cameraSessions
+                .computeIfAbsent(
+                        cameraId,
+                        k -> ConcurrentHashMap.newKeySet()
+                )
+                .add(session);
+    }
+
+    @Override
+    public void afterConnectionClosed(
+            WebSocketSession session,
+            org.springframework.web.socket.CloseStatus status
+    ) {
+
+        cameraSessions.values()
+                .forEach(set -> set.remove(session));
+    }
+
+    public void broadcast(int cameraId, byte[] imageBytes) {
+
+        Set<WebSocketSession> sessions =
+                cameraSessions.get(cameraId);
+
+        if (sessions == null) {
+            return;
+        }
+
+        sessions.forEach(session -> {
+
+            try {
+
+                if (session.isOpen()) {
+
+                    session.sendMessage(
+                            new BinaryMessage(imageBytes)
+                    );
+                }
+
+            } catch (Exception ignored) {
+            }
+        });
+    }
+}
+```
+
+---
+
+# WebSocketConfig.java
+
+```java
+package com.example.camera.ws;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.socket.config.annotation.EnableWebSocket;
+import org.springframework.web.socket.config.annotation.WebSocketConfigurer;
+import org.springframework.web.socket.config.annotation.WebSocketHandlerRegistry;
+
+@Configuration
+@EnableWebSocket
+@RequiredArgsConstructor
+public class WebSocketConfig implements WebSocketConfigurer {
+
+    private final VideoWebSocketHandler handler;
+
+    @Override
+    public void registerWebSocketHandlers(
+            WebSocketHandlerRegistry registry
+    ) {
+
+        registry.addHandler(handler, "/video")
+                .setAllowedOrigins("*");
+    }
+}
+```
+
+---
+
+# UdpVideoServer.java
+
+```java
+package com.example.camera.udp;
+
+import com.example.camera.ws.VideoWebSocketHandler;
+import jakarta.annotation.PostConstruct;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Component;
+
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Component
+@RequiredArgsConstructor
+public class UdpVideoServer {
+
+    private final VideoWebSocketHandler socketHandler;
+
+    private final Map<Integer, FrameBuffer> frameBuffers =
+            new ConcurrentHashMap<>();
+
+    @PostConstruct
+    public void start() {
+
+        Thread thread = new Thread(this::runUdp);
+
+        thread.setDaemon(true);
+
+        thread.start();
+    }
+
+    private void runUdp() {
+
+        try {
+
+            DatagramSocket socket =
+                    new DatagramSocket(5000);
+
+            byte[] receiveBuffer = new byte[1500];
+
+            while (true) {
+
+                DatagramPacket packet =
+                        new DatagramPacket(
+                                receiveBuffer,
+                                receiveBuffer.length
+                        );
+
+                socket.receive(packet);
+
+                processPacket(packet);
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void processPacket(DatagramPacket packet) {
+
+        try {
+
+            ByteBuffer bb = ByteBuffer.wrap(
+                    packet.getData(),
+                    0,
+                    packet.getLength()
+            );
+
+            bb.order(ByteOrder.BIG_ENDIAN);
+
+            int cameraId = bb.get() & 0xff;
+
+            int frameId = bb.getShort() & 0xffff;
+
+            int totalChunks = bb.getShort() & 0xffff;
+
+            int chunkIndex = bb.getShort() & 0xffff;
+
+            byte[] chunk =
+                    new byte[packet.getLength() - 7];
+
+            bb.get(chunk);
+
+            int key =
+                    (cameraId << 16) | frameId;
+
+            FrameBuffer fb =
+                    frameBuffers.computeIfAbsent(
+                            key,
+                            k -> {
+
+                                FrameBuffer f =
+                                        new FrameBuffer();
+
+                                f.totalChunks = totalChunks;
+
+                                return f;
+                            }
+                    );
+
+            fb.chunks.put(chunkIndex, chunk);
+
+            fb.lastUpdate = System.currentTimeMillis();
+
+            if (fb.isComplete()) {
+
+                byte[] image = fb.buildFrame();
+
+                if (image != null) {
+                    socketHandler.broadcast(cameraId, image);
+                }
+
+                frameBuffers.remove(key);
+            }
+
+            cleanup();
+
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void cleanup() {
+
+        long now = System.currentTimeMillis();
+
+        frameBuffers.entrySet().removeIf(
+                e -> now - e.getValue().lastUpdate > 3000
+        );
+    }
+}
+```
+
+---
+
+# VideoController.java
+
+```java
+package com.example.camera.web;
+
+import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.annotation.GetMapping;
+
+@Controller
+public class VideoController {
+
+    @GetMapping("/")
+    public String index() {
+        return "index";
+    }
+}
+```
+
+---
+
+# index.html
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+
+    <title>ESP32 Camera Viewer</title>
+
+    <style>
+
+        body {
+            font-family: Arial;
+            background: #111;
+            color: white;
+            text-align: center;
+            padding: 20px;
+        }
+
+        input {
+            padding: 10px;
+            width: 200px;
+            font-size: 16px;
+        }
+
+        button {
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        img {
+            margin-top: 20px;
+            width: 900px;
+            max-width: 100%;
+            border-radius: 10px;
+            border: 2px solid #444;
+        }
+
+    </style>
+</head>
+
+<body>
+
+<h1>ESP32 Camera Stream</h1>
+
+<div>
+
+    <input
+            id="cameraId"
+            type="number"
+            placeholder="Nhập cameraId"
+    />
+
+    <button onclick="connectCamera()">
+        Xem Camera
+    </button>
+
+</div>
+
+<br>
+
+<div>
+    <span id="status">Disconnected</span>
+</div>
+
+<img id="video"/>
+
+<script>
+
+    let socket;
+
+    const img = document.getElementById("video");
+
+    const status = document.getElementById("status");
+
+    function connectCamera() {
+
+        const cameraId =
+            document.getElementById("cameraId").value;
+
+        if (!cameraId) {
+            alert("Nhập cameraId");
+            return;
+        }
+
+        if (socket) {
+            socket.close();
+        }
+
+        socket = new WebSocket(
+            "ws://localhost:8080/video"
+        );
+
+        socket.binaryType = "arraybuffer";
+
+        socket.onopen = () => {
+
+            status.innerText =
+                "Connected camera " + cameraId;
+
+            socket.send(cameraId);
+        };
+
+        socket.onmessage = (event) => {
+
+            const blob = new Blob(
+                [event.data],
+                { type: 'image/jpeg' }
+            );
+
+            const url = URL.createObjectURL(blob);
+
+            img.src = url;
+        };
+
+        socket.onclose = () => {
+            status.innerText = "Disconnected";
+        };
+    }
+
+</script>
+
+</body>
+</html>
+```
+
+---
+
+# application.properties
+
+```properties
+spring.thymeleaf.cache=false
+```
+
+---
+
+# ESP32
+
+Ví dụ camera 1:
+
+```cpp
+uint8_t cameraId = 1;
+```
+
+Camera 2:
+
+```cpp
+uint8_t cameraId = 2;
+```
+
+---
+
+# Tối ưu ESP32
+
+```cpp
+config.frame_size = FRAMESIZE_QVGA;
+config.jpeg_quality = 15;
+config.fb_count = 2;
+config.xclk_freq_hz = 20000000;
+
+const int CHUNK_SIZE = 1400;
+```
+
+---
+
+# Chạy project
+
+## Start Spring Boot
+
+```bash
+mvn spring-boot:run
+```
+
+---
+
+# Mở browser
+
+```text
+http://localhost:8080
+```
+
+---
+
+# Test
+
+## Camera ESP32 số 1
+
+```cpp
+cameraId = 1;
+```
+
+Browser:
+
+```text
+Nhập 1
+```
+
+---
+
+## Camera ESP32 số 2
+
+```cpp
+cameraId = 2;
+```
+
+Browser:
+
+```text
+Nhập 2
+```
+
+---
+
+# Hướng nâng cấp tiếp theo
+
+Có thể nâng cấp thêm:
+
+* Danh sách camera online
+* Auto reconnect
+* FPS monitor
+* Multi viewer
+* React dashboard
+* Recording video
+* AI detection
+* Motion detect
+* Netty UDP hiệu năng cao
+* WebRTC
+* HLS
+* Authentication JWT
+* Multi tenant camera system
