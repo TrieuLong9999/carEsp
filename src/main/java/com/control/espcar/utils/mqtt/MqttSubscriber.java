@@ -1,6 +1,7 @@
 package com.control.espcar.utils.mqtt;
 
 import com.control.espcar.service.interf.DeviceInfoService;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import org.eclipse.paho.client.mqttv3.*;
 import org.springframework.stereotype.Component;
@@ -11,6 +12,7 @@ public class MqttSubscriber implements MqttCallback {
     private final MqttClient mqttClient;
     private final DeviceInfoService deviceService;
 
+    @PostConstruct
     public void init() throws MqttException {
 
         mqttClient.setCallback(this);
