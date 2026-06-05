@@ -1,0 +1,1392 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "esp_camera.h"
+#include <ArduinoJson.h>
+
+/* =========================
+   WIFI
+========================= */
+const char* WIFI_SSID = "FPT-Telecom-910A";
+const char* WIFI_PASSWORD = "1234567809";
+
+/* =========================
+   MQTT
+========================= */
+const char* MQTT_BROKER = "192.168.0.101";
+const int MQTT_PORT = 1883;
+const char* MQTT_USER = "";
+const char* MQTT_PASS = "";
+
+/* =========================
+   DEVICE INFO
+========================= */
+const char* DEVICE_ID = "ESP32CAM_001"; // serial number
+const char* TYPE_ID = "RC_CAR_CAMERA";
+const char* DEVICE_NAME = "RC Car camera ESP";
+const char* FW_VERSION = "1.0.0";
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+unsigned long lastReconnectAttempt = 0;
+
+/* =========================
+   UDP CONFIG
+========================= */
+String udpServerIp = "";
+uint16_t udpServerPort = 0;
+uint32_t streamId = 0;
+bool streaming = false;
+
+/*
+|--------------------------------------------------------------------------
+| CAMERA PINS (AI THINKER)
+|--------------------------------------------------------------------------
+*/
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+/*
+|--------------------------------------------------------------------------
+| FRAME
+|--------------------------------------------------------------------------
+*/
+uint16_t frameId = 0;
+const int CHUNK_SIZE = 1400;
+
+/* ============================================================
+   MQTT CALLBACK
+============================================================ */
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+
+    String message;
+
+    for (int i = 0; i < length; i++) {
+        message += (char)payload[i];
+    }
+
+    Serial.println("=================================");
+    Serial.println("MQTT MESSAGE");
+    Serial.println("Topic:");
+    Serial.println(topic);
+
+    Serial.println("Payload:");
+    Serial.println(message);
+
+    StaticJsonDocument<1024> doc;
+
+    DeserializationError error =
+        deserializeJson(doc, message);
+
+    if (error) {
+        Serial.println("JSON Parse Error");
+        return;
+    }
+
+    int configVersion = doc["configVersion"] | 0;
+
+    streamId = doc["streamId"] | 0;
+
+    udpServerIp = doc["stream"]["server"] | "";
+    udpServerPort = doc["stream"]["udpPort"] | 0;
+
+    if (udpServerIp.length() > 0 && udpServerPort > 0) {
+        streaming = true;
+    }
+
+    Serial.println("CONFIG RECEIVED");
+    Serial.print("Version: "); Serial.println(configVersion);
+    Serial.print("StreamId: "); Serial.println(streamId);
+    Serial.print("Server: "); Serial.println(udpServerIp);
+    Serial.print("Port: "); Serial.println(udpServerPort);
+
+    // TODO:
+    // lưu config vào Preferences/NVS
+    // khởi động stream video
+}
+
+/*
+|--------------------------------------------------------------------------
+| UDP HEADER
+|--------------------------------------------------------------------------
+*/
+struct PacketHeader {
+    uint32_t streamId;
+    uint16_t frameId;
+    uint16_t totalChunks;
+    uint16_t chunkIndex;
+} __attribute__((packed));
+
+/*
+|--------------------------------------------------------------------------
+| SEND FRAME (DEBUG FULL)
+|--------------------------------------------------------------------------
+*/
+void sendFrame(camera_fb_t* fb)
+{
+    if (!fb || !streaming) return;
+
+    uint16_t totalChunks =
+        (fb->len + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+    for (uint16_t chunkIndex = 0;
+         chunkIndex < totalChunks;
+         chunkIndex++)
+    {
+        int offset = chunkIndex * CHUNK_SIZE;
+
+        int payloadSize =
+            min(CHUNK_SIZE, (int)(fb->len - offset));
+
+        PacketHeader header;
+
+        header.streamId = htonl(streamId);
+        header.frameId = htons(frameId);
+        header.totalChunks = htons(totalChunks);
+        header.chunkIndex = htons(chunkIndex);
+
+        videoUdp.beginPacket(
+            udpServerIp.c_str(),
+            udpServerPort
+        );
+
+        videoUdp.write(
+            (uint8_t*)&header,
+            sizeof(header)
+        );
+
+        videoUdp.write(
+            fb->buf + offset,
+            payloadSize
+        );
+
+        videoUdp.endPacket();
+    }
+
+    frameId++;
+}
+/*
+|--------------------------------------------------------------------------
+| CAMERA INIT
+|--------------------------------------------------------------------------
+*/
+bool initCamera()
+{
+      camera_config_t config;
+
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+
+  config.xclk_freq_hz = 30000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  config.frame_size = FRAMESIZE_HVGA;
+  config.jpeg_quality = 15;
+  config.fb_count = 2;
+
+  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+
+  esp_err_t err = esp_camera_init(&config);
+
+  if (err != ESP_OK) {
+    Serial.printf("[CAM] Init failed: 0x%x\n", err);
+    return false;
+  }
+
+  Serial.println("[CAM] Initialized OK");
+  return true;
+}
+
+/* ============================================================
+   WIFI
+============================================================ */
+void connectWifi() {
+
+    Serial.println();
+    Serial.println("Connecting WiFi...");
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+
+    Serial.println();
+    Serial.println("WiFi Connected");
+
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+
+    Serial.print("MAC: ");
+    Serial.println(WiFi.macAddress());
+}
+
+/* ============================================================
+   REGISTER DEVICE
+============================================================ */
+void registerDevice() {
+
+    StaticJsonDocument<1024> doc;
+
+    doc["serialNumber"] = DEVICE_ID;
+    doc["typeId"] = TYPE_ID;
+    doc["deviceName"] = DEVICE_NAME;
+    doc["firmware"] = FW_VERSION;
+    doc["ipAddress"] = WiFi.localIP().toString();
+    doc["macAddress"] = WiFi.macAddress();
+    doc["configJson"] = "{}";
+
+    String payload;
+    serializeJson(doc, payload);
+
+ // Topic register theo device
+    String topic =
+        "devices/" +
+        String(DEVICE_ID) +
+        "/register";
+    Serial.print("Topic: ");
+    Serial.println(topic);
+    bool result = mqttClient.publish(
+        topic.c_str(),
+        payload.c_str(),
+        false
+    );
+
+    Serial.println("=================================");
+    Serial.println("REGISTER DEVICE");
+
+    if (result) {
+        Serial.println("SUCCESS");
+    } else {
+        Serial.println("FAILED");
+    }
+
+    Serial.println(payload);
+}
+
+/* ============================================================
+   MQTT CONNECT
+============================================================ */
+void connectMqtt() {
+
+    while (!mqttClient.connected()) {
+
+        Serial.println("Connecting MQTT...");
+
+        bool connected;
+
+        if (strlen(MQTT_USER) > 0) {
+
+            connected = mqttClient.connect(
+                DEVICE_ID,
+                MQTT_USER,
+                MQTT_PASS
+            );
+
+        } else {
+
+            connected =
+                mqttClient.connect(DEVICE_ID);
+        }
+
+        if (connected) {
+
+            Serial.println("MQTT Connected");
+
+            String configTopic =
+                "devices/" +
+                String(DEVICE_ID) +
+                "/config";
+
+            mqttClient.subscribe(configTopic.c_str(), 1);
+
+            Serial.println("Subscribed:");
+            Serial.println(configTopic);
+
+            registerDevice();
+
+        } else {
+
+            Serial.print("MQTT Failed rc=");
+            Serial.println(mqttClient.state());
+
+            delay(3000);
+        }
+    }
+}
+
+/* ============================================================
+   SETUP
+============================================================ */
+void setup() {
+
+    Serial.begin(115200);
+
+    delay(1000);
+
+    connectWifi();
+    initCamera();
+    mqttClient.setServer(
+        MQTT_BROKER,
+        MQTT_PORT
+    );
+
+    mqttClient.setCallback(mqttCallback);
+
+    connectMqtt();
+}
+
+/* ============================================================
+   LOOP
+============================================================ */
+void loop() {
+
+    if (WiFi.status() != WL_CONNECTED) {
+
+        Serial.println("WiFi Lost");
+
+        WiFi.disconnect();
+        WiFi.reconnect();
+
+        delay(5000);
+        return;
+    }
+
+    if (!mqttClient.connected()) {
+
+        unsigned long now = millis();
+
+        if (now - lastReconnectAttempt > 5000) {
+
+            lastReconnectAttempt = now;
+
+            connectMqtt();
+        }
+    }
+
+    mqttClient.loop();
+
+    // Ví dụ gửi heartbeat mỗi 30s
+    static unsigned long lastHeartbeat = 0;
+
+    if (millis() - lastHeartbeat > 30000) {
+
+        lastHeartbeat = millis();
+
+        String topic =
+            "devices/" +
+            String(DEVICE_ID) +
+            "/heartbeat";
+
+        StaticJsonDocument<256> doc;
+
+        doc["serialNumber"] = DEVICE_ID;
+        doc["freeHeap"] = ESP.getFreeHeap();
+        doc["uptime"] = millis();
+
+        String payload;
+        serializeJson(doc, payload);
+
+        mqttClient.publish(
+            topic.c_str(),
+            payload.c_str(),
+            false
+        );
+
+        Serial.println("Heartbeat sent");
+    }
+    if (streaming)
+    {
+        camera_fb_t* fb = esp_camera_fb_get();
+
+        if (fb)
+        {
+            sendFrame(fb);
+            esp_camera_fb_return(fb);
+        }
+    }
+}
+------------------
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <PubSubClient.h>
+#include "esp_camera.h"
+#include <ArduinoJson.h>
+#include <lwip/inet.h>
+
+/* =========================
+   WIFI
+========================= */
+const char* WIFI_SSID = "FPT-Telecom-910A";
+const char* WIFI_PASSWORD = "1234567809";
+
+/* =========================
+   MQTT
+========================= */
+const char* MQTT_BROKER = "192.168.0.101";
+const int MQTT_PORT = 1883;
+
+const char* MQTT_USER = "";
+const char* MQTT_PASS = "";
+
+/* =========================
+   DEVICE
+========================= */
+const char* DEVICE_ID = "ESP32CAM_001";
+const char* TYPE_ID = "RC_CAR_CAMERA";
+const char* DEVICE_NAME = "RC CAR CAMERA";
+const char* FW_VERSION = "1.0.0";
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+WiFiUDP videoUdp;
+
+/* =========================
+   STREAM
+========================= */
+String udpServerIp = "";
+uint16_t udpServerPort = 0;
+uint32_t streamId = 0;
+bool streaming = false;
+
+/* =========================
+   CAMERA PIN AI THINKER
+========================= */
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+/* =========================
+   UDP HEADER
+========================= */
+struct PacketHeader {
+    uint32_t streamId;
+    uint32_t frameId;
+    uint16_t totalChunks;
+    uint16_t chunkIndex;
+} __attribute__((packed));
+
+const int CHUNK_SIZE = 1400;
+uint32_t frameId = 0;
+
+unsigned long lastHeartbeat = 0;
+unsigned long lastReconnect = 0;
+
+/* ============================================================
+   MQTT CALLBACK
+============================================================ */
+void mqttCallback(char* topic, byte* payload, unsigned int length)
+{
+    String msg;
+
+    for (unsigned int i = 0; i < length; i++) {
+        msg += (char)payload[i];
+    }
+
+    Serial.println("MQTT CONFIG:");
+    Serial.println(msg);
+
+    StaticJsonDocument<1024> doc;
+
+    if (deserializeJson(doc, msg))
+    {
+        Serial.println("JSON ERROR");
+        return;
+    }
+
+    String command = doc["command"] | "";
+
+    if (command == "START_STREAM")
+    {
+        streaming = true;
+        Serial.println("STREAM START");
+    }
+    else if (command == "STOP_STREAM")
+    {
+        streaming = false;
+        Serial.println("STREAM STOP");
+    }
+
+    if (!doc.containsKey("stream"))
+        return;
+
+    JsonObject stream = doc["stream"];
+
+    streamId = doc["streamId"] | 0;
+    udpServerIp = stream["server"] | "";
+    udpServerPort = stream["udpPort"] | 0;
+
+    if (udpServerIp.length() > 0 && udpServerPort > 0)
+    {
+        // streaming = true;
+
+        Serial.println("STREAM START");
+        Serial.print("SERVER=");
+        Serial.println(udpServerIp);
+
+        Serial.print("PORT=");
+        Serial.println(udpServerPort);
+    }
+}
+
+/* ============================================================
+   WIFI
+============================================================ */
+void connectWifi()
+{
+    WiFi.mode(WIFI_STA);
+
+    WiFi.begin(
+        WIFI_SSID,
+        WIFI_PASSWORD
+    );
+
+    Serial.print("Connecting WiFi");
+
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        delay(500);
+        Serial.print(".");
+    }
+
+    Serial.println();
+    Serial.println("WiFi Connected");
+
+    Serial.print("IP=");
+    Serial.println(WiFi.localIP());
+}
+
+/* ============================================================
+   REGISTER DEVICE
+============================================================ */
+void registerDevice()
+{
+    StaticJsonDocument<512> doc;
+
+    doc["serialNumber"] = DEVICE_ID;
+    doc["typeId"] = TYPE_ID;
+    doc["deviceName"] = DEVICE_NAME;
+    doc["firmware"] = FW_VERSION;
+    doc["ipAddress"] = WiFi.localIP().toString();
+    doc["macAddress"] = WiFi.macAddress();
+
+    String payload;
+    serializeJson(doc, payload);
+
+    String topic =
+        "devices/" +
+        String(DEVICE_ID) +
+        "/register";
+
+    mqttClient.publish(
+        topic.c_str(),
+        payload.c_str()
+    );
+}
+
+/* ============================================================
+   MQTT
+============================================================ */
+bool connectMqtt()
+{
+    bool connected;
+
+    if (strlen(MQTT_USER))
+    {
+        connected =
+            mqttClient.connect(
+                DEVICE_ID,
+                MQTT_USER,
+                MQTT_PASS
+            );
+    }
+    else
+    {
+        connected =
+            mqttClient.connect(
+                DEVICE_ID
+            );
+    }
+
+    if (!connected)
+        return false;
+
+    String configTopic =
+        "devices/" +
+        String(DEVICE_ID) +
+        "/config";
+
+    mqttClient.subscribe(
+        configTopic.c_str(),
+        1
+    );
+
+    registerDevice();
+
+    Serial.println("MQTT Connected");
+
+    return true;
+}
+
+/* ============================================================
+   CAMERA
+============================================================ */
+bool initCamera()
+{
+    if (!psramFound())
+    {
+        Serial.println("PSRAM NOT FOUND");
+        return false;
+    }
+
+    camera_config_t config;
+
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+
+    config.pin_d0 = Y2_GPIO_NUM;
+    config.pin_d1 = Y3_GPIO_NUM;
+    config.pin_d2 = Y4_GPIO_NUM;
+    config.pin_d3 = Y5_GPIO_NUM;
+    config.pin_d4 = Y6_GPIO_NUM;
+    config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM;
+    config.pin_d7 = Y9_GPIO_NUM;
+
+    config.pin_xclk = XCLK_GPIO_NUM;
+    config.pin_pclk = PCLK_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM;
+    config.pin_href = HREF_GPIO_NUM;
+
+    config.pin_sccb_sda = SIOD_GPIO_NUM;
+    config.pin_sccb_scl = SIOC_GPIO_NUM;
+
+    config.pin_pwdn = PWDN_GPIO_NUM;
+    config.pin_reset = RESET_GPIO_NUM;
+
+    config.xclk_freq_hz = 30000000;
+
+    config.pixel_format = PIXFORMAT_JPEG;
+
+    config.frame_size = FRAMESIZE_HVGA;
+    config.jpeg_quality = 15;
+
+    config.fb_count = 3;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+
+    esp_err_t err =
+        esp_camera_init(&config);
+
+    if (err != ESP_OK)
+    {
+        Serial.printf(
+            "Camera Error 0x%x\n",
+            err
+        );
+        return false;
+    }
+
+    sensor_t* s = esp_camera_sensor_get();
+
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
+
+    Serial.println("Camera Ready");
+
+    return true;
+}
+
+/* ============================================================
+   SEND FRAME
+============================================================ */
+unsigned long lastFrameTime = 0;
+const int TARGET_FPS = 25;
+const int FRAME_INTERVAL = 1000 / TARGET_FPS;
+
+void sendFrame(camera_fb_t* fb)
+{
+    if (!fb)
+        return;
+
+    uint16_t totalChunks =
+        (fb->len + CHUNK_SIZE - 1)
+        / CHUNK_SIZE;
+
+    for (uint16_t chunkIndex = 0;
+         chunkIndex < totalChunks;
+         chunkIndex++)
+    {
+        int offset =
+            chunkIndex * CHUNK_SIZE;
+
+        int payloadSize =
+            min(
+                CHUNK_SIZE,
+                (int)(fb->len - offset)
+            );
+
+        PacketHeader header;
+
+        header.streamId =
+            htonl(streamId);
+
+        header.frameId =
+            htonl(frameId);
+
+        header.totalChunks =
+            htons(totalChunks);
+
+        header.chunkIndex =
+            htons(chunkIndex);
+
+        videoUdp.beginPacket(
+            udpServerIp.c_str(),
+            udpServerPort
+        );
+
+        videoUdp.write(
+            (uint8_t*)&header,
+            sizeof(header)
+        );
+
+        videoUdp.write(
+            fb->buf + offset,
+            payloadSize
+        );
+
+        videoUdp.endPacket();
+        yield();
+    }
+
+    frameId++;
+}
+
+/* ============================================================
+   HEARTBEAT
+============================================================ */
+void sendHeartbeat()
+{
+    StaticJsonDocument<256> doc;
+
+    doc["serialNumber"] = DEVICE_ID;
+    doc["freeHeap"] = ESP.getFreeHeap();
+    doc["uptime"] = millis();
+    doc["streaming"] = streaming;
+
+    String payload;
+    serializeJson(doc, payload);
+
+    String topic =
+        "devices/" +
+        String(DEVICE_ID) +
+        "/heartbeat";
+
+    mqttClient.publish(
+        topic.c_str(),
+        payload.c_str()
+    );
+}
+
+/* ============================================================
+   SETUP
+============================================================ */
+void setup()
+{
+    Serial.begin(115200);
+
+    connectWifi();
+
+    initCamera();
+
+    videoUdp.begin(5000);
+
+    mqttClient.setServer(
+        MQTT_BROKER,
+        MQTT_PORT
+    );
+
+    mqttClient.setCallback(
+        mqttCallback
+    );
+
+    connectMqtt();
+}
+
+/* ============================================================
+   LOOP
+============================================================ */
+void loop()
+{
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        WiFi.disconnect();
+        WiFi.reconnect();
+
+        delay(1000);
+        return;
+    }
+
+    if (!mqttClient.connected())
+    {
+        if (millis() - lastReconnect > 5000)
+        {
+            lastReconnect = millis();
+            connectMqtt();
+        }
+    }
+
+    mqttClient.loop();
+
+    if (millis() - lastHeartbeat > 30000)
+    {
+        lastHeartbeat = millis();
+        sendHeartbeat();
+    }
+
+    if (streaming)
+    {
+        unsigned long now = millis();
+
+        if (now - lastFrameTime >= FRAME_INTERVAL)
+        {
+            lastFrameTime = now;
+
+            camera_fb_t* fb = esp_camera_fb_get();
+
+            if (fb)
+            {
+                sendFrame(fb);
+                esp_camera_fb_return(fb);
+            }
+        }
+    }
+}
+
+------------------------
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <PubSubClient.h>
+#include "esp_camera.h"
+#include <ArduinoJson.h>
+#include <lwip/inet.h>
+
+/* =========================
+   WIFI
+========================= */
+const char* WIFI_SSID = "FPT-Telecom-910A";
+const char* WIFI_PASSWORD = "1234567809";
+
+/* =========================
+   MQTT
+========================= */
+const char* MQTT_BROKER = "192.168.0.101";
+const int MQTT_PORT = 1883;
+
+const char* MQTT_USER = "";
+const char* MQTT_PASS = "";
+
+/* =========================
+   DEVICE
+========================= */
+const char* DEVICE_ID = "ESP32CAM_001";
+const char* TYPE_ID = "RC_CAR_CAMERA";
+const char* DEVICE_NAME = "RC CAR CAMERA";
+const char* FW_VERSION = "1.0.0";
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+WiFiUDP videoUdp;
+
+/* =========================
+   STREAM
+========================= */
+String udpServerIp = "";
+uint16_t udpServerPort = 0;
+uint32_t streamId = 0;
+bool streaming = false;
+
+/* =========================
+   CAMERA PIN AI THINKER
+========================= */
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+/* =========================
+   UDP HEADER
+========================= */
+struct PacketHeader {
+    uint32_t streamId;
+    uint32_t frameId;
+    uint16_t totalChunks;
+    uint16_t chunkIndex;
+} __attribute__((packed));
+
+const int CHUNK_SIZE = 1400;
+uint32_t frameId = 0;
+
+unsigned long lastHeartbeat = 0;
+unsigned long lastReconnect = 0;
+
+/* ============================================================
+   MQTT CALLBACK
+============================================================ */
+void mqttCallback(char* topic, byte* payload, unsigned int length)
+{
+    String msg;
+
+    for (unsigned int i = 0; i < length; i++) {
+        msg += (char)payload[i];
+    }
+
+    Serial.println("MQTT CONFIG:");
+    Serial.println(msg);
+
+    StaticJsonDocument<1024> doc;
+
+    if (deserializeJson(doc, msg))
+    {
+        Serial.println("JSON ERROR");
+        return;
+    }
+
+    String command = doc["command"] | "";
+
+    if (command == "STOP")
+    {
+        streaming = false;
+        Serial.println("STREAM STOPPED");
+        return;
+    }
+
+    if (!doc.containsKey("stream"))
+        return;
+
+    JsonObject stream = doc["stream"];
+
+    streamId = doc["streamId"] | 0;
+    udpServerIp = stream["server"] | "";
+    udpServerPort = stream["udpPort"] | 0;
+
+    if (udpServerIp.length() > 0 && udpServerPort > 0)
+    {
+        streaming = true;
+
+        Serial.println("STREAM START");
+        Serial.print("SERVER=");
+        Serial.println(udpServerIp);
+
+        Serial.print("PORT=");
+        Serial.println(udpServerPort);
+    }
+}
+
+/* ============================================================
+   WIFI
+============================================================ */
+void connectWifi()
+{
+    WiFi.mode(WIFI_STA);
+
+    WiFi.begin(
+        WIFI_SSID,
+        WIFI_PASSWORD
+    );
+
+    Serial.print("Connecting WiFi");
+
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        delay(500);
+        Serial.print(".");
+    }
+
+    Serial.println();
+    Serial.println("WiFi Connected");
+
+    Serial.print("IP=");
+    Serial.println(WiFi.localIP());
+}
+
+/* ============================================================
+   REGISTER DEVICE
+============================================================ */
+void registerDevice()
+{
+    StaticJsonDocument<512> doc;
+
+    doc["serialNumber"] = DEVICE_ID;
+    doc["typeId"] = TYPE_ID;
+    doc["deviceName"] = DEVICE_NAME;
+    doc["firmware"] = FW_VERSION;
+    doc["ipAddress"] = WiFi.localIP().toString();
+    doc["macAddress"] = WiFi.macAddress();
+
+    String payload;
+    serializeJson(doc, payload);
+
+    String topic =
+        "devices/" +
+        String(DEVICE_ID) +
+        "/register";
+
+    mqttClient.publish(
+        topic.c_str(),
+        payload.c_str()
+    );
+}
+
+/* ============================================================
+   MQTT
+============================================================ */
+bool connectMqtt()
+{
+    bool connected;
+
+    if (strlen(MQTT_USER))
+    {
+        connected =
+            mqttClient.connect(
+                DEVICE_ID,
+                MQTT_USER,
+                MQTT_PASS
+            );
+    }
+    else
+    {
+        connected =
+            mqttClient.connect(
+                DEVICE_ID
+            );
+    }
+
+    if (!connected)
+        return false;
+
+    String configTopic =
+        "devices/" +
+        String(DEVICE_ID) +
+        "/config";
+
+    mqttClient.subscribe(
+        configTopic.c_str(),
+        1
+    );
+
+    registerDevice();
+
+    Serial.println("MQTT Connected");
+
+    return true;
+}
+
+/* ============================================================
+   CAMERA
+============================================================ */
+bool initCamera()
+{
+    if (!psramFound())
+    {
+        Serial.println("PSRAM NOT FOUND");
+        return false;
+    }
+
+    camera_config_t config;
+
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+
+    config.pin_d0 = Y2_GPIO_NUM;
+    config.pin_d1 = Y3_GPIO_NUM;
+    config.pin_d2 = Y4_GPIO_NUM;
+    config.pin_d3 = Y5_GPIO_NUM;
+    config.pin_d4 = Y6_GPIO_NUM;
+    config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM;
+    config.pin_d7 = Y9_GPIO_NUM;
+
+    config.pin_xclk = XCLK_GPIO_NUM;
+    config.pin_pclk = PCLK_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM;
+    config.pin_href = HREF_GPIO_NUM;
+
+    config.pin_sccb_sda = SIOD_GPIO_NUM;
+    config.pin_sccb_scl = SIOC_GPIO_NUM;
+
+    config.pin_pwdn = PWDN_GPIO_NUM;
+    config.pin_reset = RESET_GPIO_NUM;
+
+    config.xclk_freq_hz = 30000000;
+
+    config.pixel_format = PIXFORMAT_JPEG;
+
+    config.frame_size = FRAMESIZE_HVGA;
+    config.jpeg_quality = 15;
+
+    config.fb_count = 3;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+
+    esp_err_t err =
+        esp_camera_init(&config);
+
+    if (err != ESP_OK)
+    {
+        Serial.printf(
+            "Camera Error 0x%x\n",
+            err
+        );
+        return false;
+    }
+
+    sensor_t* s = esp_camera_sensor_get();
+
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
+
+    Serial.println("Camera Ready");
+
+    return true;
+}
+
+/* ============================================================
+   SEND FRAME
+============================================================ */
+unsigned long lastFrameTime = 0;
+const int TARGET_FPS = 25;
+const int FRAME_INTERVAL = 1000 / TARGET_FPS;
+
+void sendFrame(camera_fb_t* fb)
+{
+    if (!fb)
+        return;
+
+    uint16_t totalChunks =
+        (fb->len + CHUNK_SIZE - 1)
+        / CHUNK_SIZE;
+
+    for (uint16_t chunkIndex = 0;
+         chunkIndex < totalChunks;
+         chunkIndex++)
+    {
+        int offset =
+            chunkIndex * CHUNK_SIZE;
+
+        int payloadSize =
+            min(
+                CHUNK_SIZE,
+                (int)(fb->len - offset)
+            );
+
+        PacketHeader header;
+
+        header.streamId =
+            htonl(streamId);
+
+        header.frameId =
+            htonl(frameId);
+
+        header.totalChunks =
+            htons(totalChunks);
+
+        header.chunkIndex =
+            htons(chunkIndex);
+
+        videoUdp.beginPacket(
+            udpServerIp.c_str(),
+            udpServerPort
+        );
+
+        videoUdp.write(
+            (uint8_t*)&header,
+            sizeof(header)
+        );
+
+        videoUdp.write(
+            fb->buf + offset,
+            payloadSize
+        );
+
+        videoUdp.endPacket();
+        yield();
+    }
+
+    frameId++;
+}
+
+/* ============================================================
+   HEARTBEAT
+============================================================ */
+void sendHeartbeat()
+{
+    StaticJsonDocument<256> doc;
+
+    doc["serialNumber"] = DEVICE_ID;
+    doc["freeHeap"] = ESP.getFreeHeap();
+    doc["uptime"] = millis();
+    doc["streaming"] = streaming;
+
+    String payload;
+    serializeJson(doc, payload);
+
+    String topic =
+        "devices/" +
+        String(DEVICE_ID) +
+        "/heartbeat";
+
+    mqttClient.publish(
+        topic.c_str(),
+        payload.c_str()
+    );
+}
+
+/* ============================================================
+   SETUP
+============================================================ */
+void setup()
+{
+    Serial.begin(115200);
+
+    connectWifi();
+
+    initCamera();
+
+    videoUdp.begin(5000);
+
+    mqttClient.setServer(
+        MQTT_BROKER,
+        MQTT_PORT
+    );
+
+    mqttClient.setCallback(
+        mqttCallback
+    );
+
+    connectMqtt();
+}
+
+/* ============================================================
+   LOOP
+============================================================ */
+void loop()
+{
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        WiFi.disconnect();
+        WiFi.reconnect();
+
+        delay(1000);
+        return;
+    }
+
+    if (!mqttClient.connected())
+    {
+        if (millis() - lastReconnect > 5000)
+        {
+            lastReconnect = millis();
+            connectMqtt();
+        }
+    }
+
+    mqttClient.loop();
+
+    if (millis() - lastHeartbeat > 30000)
+    {
+        lastHeartbeat = millis();
+        sendHeartbeat();
+    }
+
+    if (streaming)
+    {
+        unsigned long now = millis();
+
+        if (now - lastFrameTime >= FRAME_INTERVAL)
+        {
+            lastFrameTime = now;
+
+            camera_fb_t* fb = esp_camera_fb_get();
+
+            if (fb)
+            {
+                sendFrame(fb);
+                esp_camera_fb_return(fb);
+            }
+        }
+    }
+}

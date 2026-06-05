@@ -34,15 +34,15 @@ public class DeviceInfoServiceImpl implements DeviceInfoService {
         try {
             Map<String, Object> data = objectMapper.readValue(payload, Map.class);
 
-            String deviceId = (String) data.get("deviceId");
+            String serialNumber = (String) data.get("serialNumber");
             String typeId = (String) data.get("typeId");
             DeviceType type = deviceTypeRepository.findById(typeId)
                     .orElseThrow(() -> new RuntimeException("Unknown type"));
 
-            DeviceInfo device = deviceInfoRepository.findById(deviceId)
+            DeviceInfo device = deviceInfoRepository.findBySerialNumber(serialNumber)
                     .orElse(new DeviceInfo());
 
-            device.setId(deviceId);
+            device.setSerialNumber(serialNumber);
             device.setDeviceType(type);
             device.setDeviceName((String) data.get("deviceName"));
             device.setFirmwareVersion((String) data.get("firmware"));
@@ -50,9 +50,10 @@ public class DeviceInfoServiceImpl implements DeviceInfoService {
             device.setMacAddress((String) data.get("macAddress"));
             device.setConfigJson((String) data.get("configJson"));
 
-            deviceInfoRepository.save(device);
+
+            DeviceInfo tempDevice =  deviceInfoRepository.save(device);
             // gửi config lại ESP
-            sendConfig(device);
+            sendConfig(tempDevice);
         }catch (Exception e){
 
         }
@@ -61,6 +62,7 @@ public class DeviceInfoServiceImpl implements DeviceInfoService {
         Map<String, Object> config = new HashMap<>();
 
         config.put("configVersion", 1);
+        config.put("streamId", device.getId());
 
         Map<String, Object> streamConfig = new HashMap<>();
         streamConfig.put("server", "192.168.0.101");
@@ -68,8 +70,8 @@ public class DeviceInfoServiceImpl implements DeviceInfoService {
         config.put("stream", streamConfig);
 
         String json = objectMapper.writeValueAsString(config);
-        String topic = "devices/" + device.getId() + "/config";
+        String topic = "devices/" + device.getSerialNumber() + "/config";
         mqttService.publish(topic, json);
-        System.out.println("📤 Config sent to " + device.getId());
+        System.out.println("📤 Config sent to " + device.getSerialNumber());
     }
 }

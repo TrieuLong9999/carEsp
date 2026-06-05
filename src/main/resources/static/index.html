@@ -2,78 +2,56 @@
 <html lang="vi">
 
 <head>
-    <meta charset="UTF-8" />
-    <title>ESP32 Camera Dashboard</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 Camera Viewer</title>
 
     <style>
+        * {
+            box-sizing: border-box;
+        }
+
         body {
-            font-family: Arial;
-            background: #0f0f0f;
-            color: white;
             margin: 0;
-            padding: 0;
+            background: #111;
+            color: white;
+            font-family: Arial, sans-serif;
         }
 
         .header {
+            background: #1e1e1e;
             padding: 15px;
-            background: #1c1c1c;
-            font-size: 18px;
+            text-align: center;
+            font-size: 22px;
+            font-weight: bold;
         }
 
         .container {
-            display: flex;
-            height: calc(100vh - 50px);
+            padding: 20px;
+            text-align: center;
         }
 
-        /* LEFT */
-        .sidebar {
-            width: 280px;
-            background: #151515;
-            padding: 10px;
-            overflow-y: auto;
-        }
-
-        .camera-item {
-            padding: 10px;
-            margin: 8px 0;
-            background: #222;
-            cursor: pointer;
-            border-radius: 6px;
-        }
-
-        .camera-item:hover {
-            background: #333;
-        }
-
-        .camera-item.active {
-            background: #0d6efd;
-        }
-
-        /* RIGHT */
-        .main {
-            flex: 1;
-            padding: 15px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }
-
-        #video {
-            width: 80%;
-            max-width: 900px;
-            border-radius: 10px;
-            border: 2px solid #333;
-            margin-top: 10px;
+        .status {
+            margin-bottom: 15px;
+            font-size: 16px;
         }
 
         .info {
-            margin-top: 10px;
+            margin-bottom: 15px;
             color: #aaa;
         }
 
-        .title {
-            font-size: 20px;
-            margin-bottom: 10px;
+        #video {
+            width: 90%;
+            max-width: 1000px;
+            border-radius: 10px;
+            border: 2px solid #333;
+            background: black;
+        }
+
+        .stats {
+            margin-top: 15px;
+            color: #00ff88;
         }
     </style>
 </head>
@@ -81,92 +59,133 @@
 <body>
 
 <div class="header">
-    🎥 ESP32 Camera Dashboard
+    🎥 ESP32 Camera Stream
 </div>
 
 <div class="container">
 
-    <!-- LEFT SIDEBAR -->
-    <div class="sidebar">
-        <h3>Danh sách camera</h3>
-        <div id="cameraList"></div>
+    <div class="status" id="status">
+        Connecting...
     </div>
 
-    <!-- MAIN -->
-    <div class="main">
+    <div class="info">
+        Stream ID: <b>1</b>
+    </div>
 
-        <div class="title" id="cameraTitle">
-            Chọn camera để xem
-        </div>
+    <img id="video">
 
-        <div class="info" id="status">
-            Disconnected
-        </div>
-
-        <img id="video" />
-
+    <div class="stats">
+        FPS: <span id="fps">0</span>
+        |
+        Frames: <span id="frames">0</span>
     </div>
 
 </div>
 
 <script>
 
-    let socket = null;
-    let currentCameraId = null;
+    const STREAM_ID = "1";
 
-    const cameraListEl = document.getElementById("cameraList");
     const video = document.getElementById("video");
     const statusEl = document.getElementById("status");
-    const titleEl = document.getElementById("cameraTitle");
+    const fpsEl = document.getElementById("fps");
+    const framesEl = document.getElementById("frames");
 
-    // =========================
-    // LOAD CAMERA LIST
-    // =========================
-    async function loadCameras() {
+    let socket = null;
 
-        const res = await fetch("/api/cameras");
-        const cameras = await res.json();
+    let frameCount = 0;
+    let fps = 0;
 
-        cameraListEl.innerHTML = "";
+    function connectWebSocket() {
 
-        cameras.forEach(cam => {
+        const protocol =
+            location.protocol === "https:"
+                ? "wss"
+                : "ws";
 
-            const div = document.createElement("div");
-            div.className = "camera-item";
-            div.innerText = `Camera ${cam.cameraId} - ${cam.ip}`;
+        const wsUrl =
+            `${protocol}://${location.host}/video`;
 
-            div.onclick = () => selectCamera(cam.cameraId, div);
+        console.log("CONNECT:", wsUrl);
 
-            cameraListEl.appendChild(div);
-        });
-    }
-
-    // =========================
-    // SELECT CAMERA
-    // =========================
-    function selectCamera(cameraId, element) {
-
-        currentCameraId = cameraId;
-
-        titleEl.innerText = "Camera " + cameraId;
-
-        document.querySelectorAll(".camera-item")
-            .forEach(e => e.classList.remove("active"));
-
-        element.classList.add("active");
-
-        connectWebSocket(cameraId);
-    }
-
-    // =========================
-    // CONNECT WS
-    // =========================
-    function connectWebSocket(cameraId) {
-
-        if (socket) {
-            socket.close();
-        }
-
-        socket = new WebSocket("ws://localhost:8080/video");
+        socket = new WebSocket(wsUrl);
 
         socket.binaryType = "arraybuffer";
+
+        socket.onopen = () => {
+
+            console.log("WS OPEN");
+
+            statusEl.innerHTML =
+                "🟢 Connected";
+
+            socket.send(STREAM_ID);
+        };
+
+        socket.onmessage = (event) => {
+
+            if (typeof event.data === "string") {
+
+                console.log("TEXT:", event.data);
+                return;
+            }
+
+            frameCount++;
+
+            framesEl.innerText = frameCount;
+
+            const blob = new Blob(
+                [event.data],
+                {
+                    type: "image/jpeg"
+                }
+            );
+
+            const imageUrl =
+                URL.createObjectURL(blob);
+
+            video.onload = () => {
+                URL.revokeObjectURL(imageUrl);
+            };
+
+            video.src = imageUrl;
+        };
+
+        socket.onclose = () => {
+
+            console.log("WS CLOSED");
+
+            statusEl.innerHTML =
+                "🔴 Disconnected - Reconnecting...";
+
+            setTimeout(
+                connectWebSocket,
+                3000
+            );
+        };
+
+        socket.onerror = (err) => {
+
+            console.error(err);
+
+            statusEl.innerHTML =
+                "⚠️ Error";
+        };
+    }
+
+    setInterval(() => {
+
+        fpsEl.innerText = fps;
+
+        fps = frameCount;
+        frameCount = 0;
+
+    }, 1000);
+
+    connectWebSocket();
+
+</script>
+
+</body>
+
+</html>

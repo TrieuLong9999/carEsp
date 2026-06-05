@@ -1,27 +1,40 @@
 package com.control.espcar.ws;
 
+
+import com.control.espcar.entity.DeviceInfo;
+import com.control.espcar.repository.DeviceInfoRepository;
+import com.control.espcar.utils.mqtt.MqttService;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.*;
-
 import org.springframework.web.socket.handler.BinaryWebSocketHandler;
 
-import java.util.Map;
 import java.util.Set;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Component
 public class VideoWebSocketHandler extends BinaryWebSocketHandler {
-    // cameraId -> sessions
-    private final Map<Integer, Set<WebSocketSession>> cameraSessions =
+
+    // streamId -> sessions
+    private final Map<String, Set<WebSocketSession>> streamSessions =
             new ConcurrentHashMap<>();
 
-    // sessionId -> cameraId
-    private final Map<String, Integer> sessionCameraMap =
+    // sessionId -> streamId
+    private final Map<String, String> sessionStreamMap =
             new ConcurrentHashMap<>();
 
-    // tránh spam START/STOP
-    private final Set<Integer> streamingCamera =
+    // streamId đang chạy
+    private final Set<String> activeStreams =
             ConcurrentHashMap.newKeySet();
+
+    private final MqttService mqttService;
+
+    private final DeviceInfoRepository deviceInfoRepository;
+
+    public VideoWebSocketHandler(MqttService mqttService, DeviceInfoRepository deviceInfoRepository) {
+        this.mqttService = mqttService;
+        this.deviceInfoRepository = deviceInfoRepository;
+    }
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) {
@@ -34,63 +47,97 @@ public class VideoWebSocketHandler extends BinaryWebSocketHandler {
             TextMessage message
     ) {
 
+        String streamId = message.getPayload().trim();
+
         try {
+            String oldStream = sessionStreamMap.get(session.getId());
 
-            int cameraId = Integer.parseInt(message.getPayload().trim());
+            // remove khỏi stream cũ nếu đổi stream
+            if (oldStream != null && !oldStream.equals(streamId)) {
 
-            Integer oldCameraId = sessionCameraMap.get(session.getId());
-
-            // remove camera cũ
-            if (oldCameraId != null) {
-                Set<WebSocketSession> oldSet =
-                        cameraSessions.get(oldCameraId);
+                Set<WebSocketSession> oldSet = streamSessions.get(oldStream);
 
                 if (oldSet != null) {
                     oldSet.remove(session);
+
+                    // check STOP stream cũ
+                    if (oldSet.isEmpty()) {
+                        stopStreamIfNeeded(oldStream);
+                    }
                 }
             }
 
-            boolean wasEmpty =
-                    viewerCount(cameraId) == 0;
-
-            // add camera mới
-            cameraSessions
-                    .computeIfAbsent(cameraId,
-                            k -> ConcurrentHashMap.newKeySet())
+            // add session vào stream mới
+            streamSessions
+                    .computeIfAbsent(streamId, k -> ConcurrentHashMap.newKeySet())
                     .add(session);
 
-            sessionCameraMap.put(session.getId(), cameraId);
+            sessionStreamMap.put(session.getId(), streamId);
 
-            session.sendMessage(
-                    new TextMessage("CONNECTED:" + cameraId)
-            );
+            session.sendMessage(new TextMessage("CONNECTED:" + streamId));
 
-            System.out.println("VIEW camera " + cameraId);
+            System.out.println("VIEW STREAM " + streamId);
 
-            // =========================
-            // START STREAM nếu là viewer đầu tiên
-            // =========================
-            if (wasEmpty && streamingCamera.add(cameraId)) {
-
-
+            // START STREAM khi từ 0 → 1
+            if (viewerCount(streamId) == 1) {
+                startStreamIfNeeded(streamId);
             }
 
         } catch (Exception e) {
-
             try {
-                session.sendMessage(
-                        new TextMessage("INVALID_CAMERA_ID")
-                );
+                session.sendMessage(new TextMessage("ERROR"));
             } catch (Exception ignored) {}
 
             e.printStackTrace();
         }
     }
 
-    public void broadcast(int cameraId, byte[] imageBytes) {
+    // =========================
+    // STREAM CONTROL
+    // =========================
 
-        Set<WebSocketSession> sessions =
-                cameraSessions.get(cameraId);
+    private void startStreamIfNeeded(String streamId) {
+
+        if (activeStreams.add(streamId)) {
+            DeviceInfo deviceInfo = deviceInfoRepository.findById(Long.parseLong(streamId)).orElse(null);
+            if(deviceInfo == null) return;
+            System.out.println("START STREAM " + streamId);
+
+            mqttService.publish(
+                    "devices/" + deviceInfo.getSerialNumber() + "/control",
+                    """
+                    {"cmd":"START_STREAM"}
+                    """
+            );
+        }
+    }
+
+    private void stopStreamIfNeeded(String streamId) {
+
+        if (viewerCount(streamId) == 0 && activeStreams.remove(streamId)) {
+
+            DeviceInfo deviceInfo = deviceInfoRepository.findById(Long.parseLong(streamId)).orElse(null);
+            if(deviceInfo == null) return;
+            System.out.println("STOP STREAM " + streamId);
+
+            mqttService.publish(
+                    "devices/" + deviceInfo.getSerialNumber() + "/control",
+                    """
+                    {"cmd":"STOP_STREAM"}
+                    """
+            );
+
+            streamSessions.remove(streamId);
+        }
+    }
+
+    // =========================
+    // BROADCAST FRAME
+    // =========================
+
+    public void broadcast(String streamId, byte[] imageBytes) {
+
+        Set<WebSocketSession> sessions = streamSessions.get(streamId);
 
         if (sessions == null || sessions.isEmpty()) return;
 
@@ -101,9 +148,15 @@ public class VideoWebSocketHandler extends BinaryWebSocketHandler {
         for (WebSocketSession s : sessions) {
             try {
                 s.sendMessage(msg);
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                sessions.remove(s);
+            }
         }
     }
+
+    // =========================
+    // CLEANUP SESSION
+    // =========================
 
     @Override
     public void afterConnectionClosed(
@@ -111,40 +164,33 @@ public class VideoWebSocketHandler extends BinaryWebSocketHandler {
             CloseStatus status
     ) {
 
-        Integer cameraId =
-                sessionCameraMap.remove(session.getId());
+        String streamId = sessionStreamMap.remove(session.getId());
 
-        if (cameraId == null) return;
+        if (streamId == null) return;
 
-        Set<WebSocketSession> sessions =
-                cameraSessions.get(cameraId);
+        Set<WebSocketSession> sessions = streamSessions.get(streamId);
 
         if (sessions != null) {
+
             sessions.remove(session);
 
-            if (sessions.isEmpty()) {
+            System.out.println("WS CLOSE: " + session.getId());
 
-                cameraSessions.remove(cameraId);
-
-                // =========================
-                // STOP STREAM khi không còn ai xem
-                // =========================
-                if (streamingCamera.remove(cameraId)) {
-
-
-                }
-            }
+            // chỉ STOP khi thật sự hết viewer
+            stopStreamIfNeeded(streamId);
         }
-
-        System.out.println("WS CLOSE: " + session.getId());
     }
 
-    public int viewerCount(int cameraId) {
-        Set<WebSocketSession> set = cameraSessions.get(cameraId);
-        return set == null ? 0 : set.size();
+    // =========================
+    // UTILS
+    // =========================
+
+    public int viewerCount(String streamId) {
+        Set<WebSocketSession> sessions = streamSessions.get(streamId);
+        return sessions == null ? 0 : sessions.size();
     }
 
-    public boolean hasViewer(int cameraId) {
-        return viewerCount(cameraId) > 0;
+    public boolean hasViewer(String streamId) {
+        return viewerCount(streamId) > 0;
     }
 }

@@ -11,7 +11,11 @@ import java.util.List;
 @Table(name = "DEVICE_INFO")
 public class DeviceInfo {
     @Id
-    private String id;
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;   // internal ID (fast, index, join tốt)
+
+    @Column(name = "SERIAL_NUMBER")
+    private String serialNumber;
 
     @Column(name = "DEVICE_NAME")
     private String deviceName;

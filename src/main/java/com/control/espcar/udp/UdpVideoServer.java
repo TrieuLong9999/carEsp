@@ -33,7 +33,7 @@ public class UdpVideoServer {
 
         try (DatagramSocket socket = new DatagramSocket(5000)) {
 
-            byte[] buffer = new byte[2048];
+            byte[] buffer = new byte[4096];
 
             while (true) {
 
@@ -54,7 +54,7 @@ public class UdpVideoServer {
 
             int len = packet.getLength();
 
-            if (len < 7) {
+            if (len < 12) {
                 System.out.println("[UDP] invalid packet size: " + len);
                 return;
             }
@@ -62,19 +62,27 @@ public class UdpVideoServer {
             ByteBuffer bb = ByteBuffer.wrap(packet.getData(), 0, len);
             bb.order(ByteOrder.BIG_ENDIAN);
 
-            int cameraId = bb.get() & 0xFF;
-            int frameId = bb.getShort() & 0xFFFF;
+            long streamId = Integer.toUnsignedLong(bb.getInt());
+
+            long frameId = Integer.toUnsignedLong(bb.getInt());
+
             int totalChunks = bb.getShort() & 0xFFFF;
+
             int chunkIndex = bb.getShort() & 0xFFFF;
 
-            byte[] chunk = new byte[len - 7];
+            byte[] chunk = new byte[len - 12];
+
             bb.get(chunk);
 
-            String key = cameraId + "_" + frameId;
+            String key = streamId  + "_" + frameId;
 
             System.out.printf(
-                    "[UDP] cam=%d frame=%d chunk=%d/%d size=%d\n",
-                    cameraId, frameId, chunkIndex, totalChunks, chunk.length
+                    "[UDP] stream=%d frame=%d chunk=%d/%d size=%d\n",
+                    streamId,
+                    frameId,
+                    chunkIndex,
+                    totalChunks,
+                    chunk.length
             );
 
             FrameBuffer fb = frameBuffers.computeIfAbsent(key, k -> {
@@ -97,7 +105,7 @@ public class UdpVideoServer {
                 byte[] image = fb.buildFrame();
 
                 if (image != null && image.length > 0) {
-                    socketHandler.broadcast(cameraId, image);
+                    socketHandler.broadcast(String.valueOf(streamId), image);
                     System.out.println("[UDP] BROADCAST OK");
                 } else {
                     System.out.println("[UDP] frame build failed");
