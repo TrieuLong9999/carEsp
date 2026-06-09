@@ -1,181 +1,273 @@
 <!DOCTYPE html>
 <html lang="vi">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32 Camera Viewer</title>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>ESP32 RC Dashboard</title>
+
     <style>
         * { box-sizing: border-box; }
-        body { margin: 0; background: #111; color: white; font-family: Arial, sans-serif; }
-        .header { background: #1e1e1e; padding: 15px; text-align: center; font-size: 22px; font-weight: bold; }
-        .container { padding: 20px; text-align: center; }
-        .status { margin-bottom: 15px; font-size: 16px; }
-        .info { margin-bottom: 15px; color: #aaa; }
 
-        /* CSS dùng chung cho cả img hoặc canvas */
+        body {
+            margin: 0;
+            background: #111;
+            color: white;
+            font-family: Arial;
+        }
+
+        .header {
+            background: #1e1e1e;
+            padding: 12px;
+            text-align: center;
+            font-size: 20px;
+            font-weight: bold;
+        }
+
+        .container {
+            text-align: center;
+            padding: 15px;
+        }
+
+        .status {
+            margin: 10px;
+            color: #aaa;
+        }
+
+        /* ===== VIDEO FIX CHÍNH ===== */
         #videoView {
-            width: 90%;
-            max-width: 1000px;
+            width: 95%;
+            max-width: 900px;
+
+            aspect-ratio: 16 / 9;   /* FIX KHÔNG MẤT KHUNG */
+
+            background: black;
             border-radius: 10px;
             border: 2px solid #333;
-            background: black;
-            display: inline-block;
+
+            display: block;
+            margin: 0 auto;
+            object-fit: cover;
         }
-        .stats { margin-top: 15px; color: #00ff88; }
+
+        /* CONTROLS */
+        .controls {
+            margin-top: 15px;
+        }
+
+        .controls button {
+            margin: 5px;
+            padding: 10px 14px;
+            border: none;
+            border-radius: 8px;
+            background: #333;
+            color: white;
+            cursor: pointer;
+        }
+
+        .controls button.active {
+            background: #00aa55;
+        }
+
+        .stats {
+            margin-top: 10px;
+            color: #00ff88;
+        }
     </style>
 </head>
+
 <body>
 
-<div class="header">🎥 ESP32 Camera Stream</div>
+<div class="header">🚗 ESP32 RC + Camera Dashboard</div>
 
 <div class="container">
+
     <div class="status" id="status">Connecting...</div>
-    <div class="info">Stream ID: <b>1</b></div>
 
     <div id="videoContainer"></div>
 
-    <div class="stats">
-        FPS: <span id="fps">0</span> | Frames: <span id="frames">0</span>
+    <!-- CONTROL -->
+    <div class="controls">
+
+        <button id="headlightBtn" onclick="toggleHeadlight()">
+            🔆 Bật đèn
+        </button>
+
+        <button id="blinkBtn">⚡ NHÁY HOLD</button>
+
+        <br/>
+
+        <button onclick="selectStream('1')">📷 Cam 1</button>
+        <button onclick="selectStream('2')">📷 Cam 2</button>
+
     </div>
+
+    <div class="stats">
+        FPS: <span id="fps">0</span> |
+        Frames: <span id="frames">0</span>
+    </div>
+
 </div>
 
 <script>
-    const STREAM_ID = "1";
-    const statusEl = document.getElementById("status");
-    const fpsEl = document.getElementById("fps");
-    const framesEl = document.getElementById("frames");
-    const videoContainer = document.getElementById("videoContainer");
+
+    const DEVICE_ID = "ESP32CAR_001";
+    let STREAM_ID = "1";
 
     let socket = null;
     let frameCount = 0;
     let fps = 0;
-    let reconnectTimeout = null;
-    let isComponentDestroyed = false;
+    let headlightOn = false;
+    /* ================= VIDEO INIT ================= */
+    const videoContainer = document.getElementById("videoContainer");
+    const statusEl = document.getElementById("status");
+    const fpsEl = document.getElementById("fps");
+    const framesEl = document.getElementById("frames");
 
-    // --- KIỂM TRA MÔI TRƯỜNG ĐỂ CHỌN THÀNH PHẦN PHÙ HỢP ---
-    // iOS Safari quản lý bộ nhớ ảnh rất kém, ưu tiên dùng Canvas + ImageBitmap.
-    // Máy tính/Android dùng Canvas hoặc Img đều tốt, nhưng dùng Canvas sẽ đồng bộ hiệu năng hơn.
-    const useCanvas = typeof window.createImageBitmap === 'function';
-    let videoTarget = null;
-    let ctx = null;
-    let oldImageUrl = null; // Dùng riêng cho chế độ thẻ IMG phòng hờ
+    let videoTarget = document.createElement("img");
+    videoTarget.id = "videoView";
+    videoContainer.appendChild(videoTarget);
 
-    if (useCanvas) {
-        videoTarget = document.createElement('canvas');
-        videoTarget.id = "videoView";
-        ctx = videoTarget.getContext('2d');
-        videoContainer.appendChild(videoTarget);
-        console.log("Môi trường hỗ trợ hiệu năng cao: Khởi tạo CANVAS");
-    } else {
-        videoTarget = document.createElement('img');
-        videoTarget.id = "videoView";
-        videoContainer.appendChild(videoTarget);
-        console.log("Môi trường cũ: Khởi tạo IMG");
-    }
+    let lastUrl = null;
 
-    // --- HÀM KẾT NỐI WEBSOCKET ---
-    function connectWebSocket() {
-        if (isComponentDestroyed) return;
-        if (reconnectTimeout) clearTimeout(reconnectTimeout);
+    /* ================= WS CONNECT ================= */
+    function connectWS() {
 
-        const protocol = location.protocol === "https:" ? "wss" : "ws";
-        // Nếu chạy local file để test, hãy thay `location.host` bằng IP của ESP32 (VD: "119.168.1.5")
-        const host = location.host || "192.168.1.5";
-        const wsUrl = `${protocol}://${host}/video`;
+        const wsUrl = `ws://${location.host || "192.168.1.5"}/video`;
 
-        console.log("Đang kết nối tới:", wsUrl);
         socket = new WebSocket(wsUrl);
         socket.binaryType = "arraybuffer";
 
         socket.onopen = () => {
-            console.log("WS OPEN");
             statusEl.innerHTML = "🟢 Connected";
-            socket.send(STREAM_ID);
+
+            send({
+                type: "STREAM_SELECT",
+                streamId: STREAM_ID,
+                deviceId: null,
+                cmd: null,
+                data: null
+            });
         };
 
-        socket.onmessage = async (event) => {
-            if (typeof event.data === "string") {
-                // Nhận tín hiệu Ping hoặc lệnh Text từ Server thì bỏ qua hoặc log, không xử lý như ảnh
-                console.log("TXT:", event.data);
-                return;
-            }
+        socket.onmessage = (event) => {
+
+            if (typeof event.data === "string") return;
 
             frameCount++;
             framesEl.innerText = frameCount;
 
             const blob = new Blob([event.data], { type: "image/jpeg" });
+            const url = URL.createObjectURL(blob);
 
-            // XỬ LÝ THEO MÔI TRƯỜNG
-            if (useCanvas) {
-                // Cách tối ưu cho Máy tính mạnh và iOS (Không rò rỉ RAM)
-                try {
-                    const bitmap = await createImageBitmap(blob);
-                    if (videoTarget.width !== bitmap.width || videoTarget.height !== bitmap.height) {
-                        videoTarget.width = bitmap.width;
-                        videoTarget.height = bitmap.height;
-                    }
-                    ctx.drawImage(bitmap, 0, 0);
-                    bitmap.close(); // Giải phóng RAM ngay lập tức trên iOS
-                } catch (err) {
-                    console.error("Lỗi vẽ Bitmap:", err);
-                }
-            } else {
-                // Cách dự phòng cho các trình duyệt quá cũ dùng thẻ <img>
-                const newImageUrl = URL.createObjectURL(blob);
-                videoTarget.src = newImageUrl;
+            videoTarget.src = url;
 
-                // Thu hồi vùng nhớ của Khung hình trước đó (Xóa gối đầu để iOS không bị đầy RAM)
-                if (oldImageUrl) {
-                    URL.revokeObjectURL(oldImageUrl);
-                }
-                oldImageUrl = newImageUrl;
+            // FIX MEMORY + LAYOUT STABLE
+            if (lastUrl) {
+                URL.revokeObjectURL(lastUrl);
             }
+            lastUrl = url;
         };
 
-        socket.onclose = (e) => {
-            console.log(`WS CLOSED (Code: ${e.code}). Đang thử kết nối lại sau 3s...`);
-            statusEl.innerHTML = "🔴 Disconnected - Reconnecting...";
-
-            // Xóa bộ nhớ đệm cũ khi đóng kết nối để giải phóng RAM triệt để
-            if (oldImageUrl) {
-                URL.revokeObjectURL(oldImageUrl);
-                oldImageUrl = null;
-            }
-
-            reconnectTimeout = setTimeout(connectWebSocket, 3000);
+        socket.onclose = () => {
+            statusEl.innerHTML = "🔴 Reconnecting...";
+            setTimeout(connectWS, 2000);
         };
 
-        socket.onerror = (err) => {
-            console.error("WS ERROR:", err);
+        socket.onerror = () => {
             statusEl.innerHTML = "⚠️ Error";
         };
     }
 
-    // --- TỐI ƯU CHO THIẾT BỊ DI ĐỘNG (Xử lý khi tắt màn hình / Đổi Tab) ---
-    // Trên máy tính đổi tab không sao, nhưng trên iPhone nếu tắt màn hình mà giữ kết nối ngầm
-    // Hệ điều hành sẽ ép ngắt (Kill) để tiết kiệm pin. Ta chủ động đóng trước và bật lại sau.
-    document.addEventListener("visibilitychange", () => {
-        if (document.hidden) {
-            console.log("Ứng dụng chạy ngầm: Chủ động ngắt kết nối để bảo vệ RAM/Pin");
-            if (socket) {
-                socket.close();
-            }
-            if (reconnectTimeout) clearTimeout(reconnectTimeout);
-        } else {
-            console.log("Ứng dụng hoạt động trở lại: Tái kết nối");
-            connectWebSocket();
-        }
-    });
+    /* ================= SEND ================= */
+    function send(obj) {
+        if (!socket || socket.readyState !== 1) return;
+        socket.send(JSON.stringify(obj));
+    }
 
-    // --- TÍNH FPS ĐỒNG BỘ ---
+    /* ================= STREAM ================= */
+    function selectStream(id) {
+        STREAM_ID = id;
+
+        send({
+            type: "STREAM_SELECT",
+            streamId: STREAM_ID,
+            deviceId: null,
+            cmd: null,
+            data: null
+        });
+    }
+
+    /* ================= CAR CONTROL ================= */
+    function sendCar(cmd) {
+
+        send({
+            type: "CAR_CONTROL",
+            streamId: STREAM_ID,
+            deviceId: DEVICE_ID,
+            cmd: cmd,
+            data: null
+        });
+    }
+
+    /* ================= HOLD BLINK (FIXED) ================= */
+    const blinkBtn = document.getElementById("blinkBtn");
+    let blinking = false;
+
+    function startBlink() {
+        if (blinking) return;
+        blinking = true;
+
+        blinkBtn.classList.add("active");
+        sendCar("BLINK_ON");
+    }
+
+    function stopBlink() {
+        if (!blinking) return;
+        blinking = false;
+
+        blinkBtn.classList.remove("active");
+        sendCar("BLINK_OFF");
+    }
+
+    /* POINTER EVENTS (BEST PRACTICE) */
+    blinkBtn.addEventListener("pointerdown", startBlink);
+    blinkBtn.addEventListener("pointerup", stopBlink);
+    blinkBtn.addEventListener("pointercancel", stopBlink);
+    blinkBtn.addEventListener("pointerleave", stopBlink);
+
+    /* ================= FPS ================= */
     setInterval(() => {
         fpsEl.innerText = fps;
         fps = frameCount;
         frameCount = 0;
     }, 1000);
 
-    // Bắt đầu chạy
-    connectWebSocket();
+    /* ================= START ================= */
+    connectWS();
+    function toggleHeadlight() {
+
+        headlightOn = !headlightOn;
+
+        if (headlightOn) {
+            sendCar("HEADLIGHT_ON");
+            updateHeadlightUI(true);
+        } else {
+            sendCar("HEADLIGHT_OFF");
+            updateHeadlightUI(false);
+        }
+    }
+    function updateHeadlightUI(state) {
+
+        const btn = document.getElementById("headlightBtn");
+
+        if (state) {
+            btn.innerText = "💡 Tắt đèn";
+            btn.style.background = "#ffb300";
+        } else {
+            btn.innerText = "🔆 Bật đèn";
+            btn.style.background = "#333";
+        }
+    }
 </script>
 
 </body>

@@ -7,6 +7,7 @@ import com.control.espcar.utils.mqtt.MqttService;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.*;
 import org.springframework.web.socket.handler.BinaryWebSocketHandler;
+import tools.jackson.databind.ObjectMapper;
 
 import java.util.Set;
 import java.util.Map;
@@ -47,13 +48,23 @@ public class VideoWebSocketHandler extends BinaryWebSocketHandler {
             TextMessage message
     ) {
 
-        String streamId = message.getPayload().trim();
+//        String streamId = message.getPayload().trim();
 
         try {
+            ObjectMapper mapper = new ObjectMapper();
+
+            WsMessage wsMessage =
+                    mapper.readValue(message.getPayload(), WsMessage.class);
+
             String oldStream = sessionStreamMap.get(session.getId());
 
+            if("CAR_CONTROL".equals(wsMessage.getType())){
+
+                handleCarControl(wsMessage);
+                return;
+            }
             // remove khỏi stream cũ nếu đổi stream
-            if (oldStream != null && !oldStream.equals(streamId)) {
+            if (oldStream != null && !oldStream.equals(wsMessage.getStreamId())) {
 
                 Set<WebSocketSession> oldSet = streamSessions.get(oldStream);
 
@@ -62,25 +73,25 @@ public class VideoWebSocketHandler extends BinaryWebSocketHandler {
 
                     // check STOP stream cũ
                     if (oldSet.isEmpty()) {
-                        stopStreamIfNeeded(oldStream);
+                        stopStreamIfNeeded(wsMessage.getStreamId());
                     }
                 }
             }
 
             // add session vào stream mới
             streamSessions
-                    .computeIfAbsent(streamId, k -> ConcurrentHashMap.newKeySet())
+                    .computeIfAbsent(wsMessage.getStreamId(), k -> ConcurrentHashMap.newKeySet())
                     .add(session);
 
-            sessionStreamMap.put(session.getId(), streamId);
+            sessionStreamMap.put(session.getId(), wsMessage.getStreamId());
 
-            session.sendMessage(new TextMessage("CONNECTED:" + streamId));
+            session.sendMessage(new TextMessage("CONNECTED:" + wsMessage.getStreamId()));
 
-            System.out.println("VIEW STREAM " + streamId);
+            System.out.println("VIEW STREAM " + wsMessage.getStreamId());
 
             // START STREAM khi từ 0 → 1
-            if (viewerCount(streamId) == 1) {
-                startStreamIfNeeded(streamId);
+            if (viewerCount(wsMessage.getStreamId()) == 1) {
+                startStreamIfNeeded(wsMessage.getStreamId());
             }
 
         } catch (Exception e) {
@@ -179,6 +190,8 @@ public class VideoWebSocketHandler extends BinaryWebSocketHandler {
             // chỉ STOP khi thật sự hết viewer
             stopStreamIfNeeded(streamId);
         }
+        sentControlDevice(streamId, "DESTROY");
+
     }
 
     // =========================
@@ -193,4 +206,31 @@ public class VideoWebSocketHandler extends BinaryWebSocketHandler {
     public boolean hasViewer(String streamId) {
         return viewerCount(streamId) > 0;
     }
+
+    private void handleCarControl(WsMessage wsMessage){
+        String caseCmd = wsMessage.getCmd();
+        String serialNumber = wsMessage.getDeviceId();
+        switch (caseCmd){
+            case "HEADLIGHT_ON","BLINK_ON", "BLINK_OFF", "HEADLIGHT_OFF":
+                sentControlDevice(wsMessage.getStreamId(), wsMessage.getCmd());
+            break;
+        }
+    }
+
+    private void sentControlDevice(String streamId, String cmd) {
+
+        DeviceInfo deviceInfo = deviceInfoRepository.findById(Long.parseLong(streamId)).orElse(null);
+        if(deviceInfo == null) return;
+        System.out.println("STOP STREAM " + streamId);
+
+        String cmdQuery = "{\"cmd\":\""+cmd+"\"}";
+        mqttService.publish(
+                "devices/" + deviceInfo.getSerialNumber() + "/control",
+                cmdQuery
+        );
+
+        streamSessions.remove(streamId);
+
+    }
+
 }
