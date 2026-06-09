@@ -1,0 +1,142 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+/* ================= WIFI ================= */
+const char* WIFI_SSID = "FPT-Telecom-910A";
+const char* WIFI_PASSWORD = "1234567809";
+
+/* ================= MQTT ================= */
+const char* MQTT_BROKER = "192.168.0.101";
+const int MQTT_PORT = 1883;
+
+/* =========================
+   DEVICE
+========================= */
+const char* DEVICE_ID = "ESP32CAM_001";
+const char* TYPE_ID = "RC_CAR_CAMERA";
+const char* DEVICE_NAME = "RC CAR CAMERA";
+const char* FW_VERSION = "1.0.0";
+
+/* =========================
+   CORE
+========================= */
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+/* ================= GPIO ================= */
+const int HEADLIGHT_PIN = 13;
+String mode = "OFF";
+
+/* ================= WIFI ================= */
+void connectWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("WiFi connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi OK");
+  Serial.println(WiFi.localIP());
+}
+
+/* ================= MQTT CALLBACK ================= */
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+
+  String msg;
+  for (int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+
+  Serial.println("MQTT: " + msg);
+
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, msg)) return;
+
+  String cmd = doc["cmd"] | "";
+
+  if (cmd == "HEADLIGHT_ON") {
+    mode = "ON";
+  }
+  else if (cmd == "HEADLIGHT_OFF") {
+    mode = "OFF";
+    digitalWrite(HEADLIGHT_PIN, LOW);
+  }
+  else if (cmd == "BLINK_ON") {
+    mode = "BLINK";
+  }
+  else if (cmd == "BLINK_OFF") {
+    mode = "OFF";
+    digitalWrite(HEADLIGHT_PIN, LOW);
+  }else if (cmd == "DESTROY"){
+    mode = "DESTROY";
+  }
+}
+/* ================= MQTT CONNECT ================= */
+bool connectMqtt() {
+  if (mqttClient.connect(DEVICE_ID)) {
+
+    mqttClient.subscribe(("devices/" + String(DEVICE_ID) + "/control").c_str());
+
+    Serial.println("MQTT CONNECTED");
+    return true;
+  }
+  return false;
+}
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(HEADLIGHT_PIN, OUTPUT);
+  digitalWrite(HEADLIGHT_PIN, LOW);
+
+  connectWifi();
+
+  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+
+  connectMqtt();
+}
+
+
+/* ================= LOOP ================= */
+void loop() {
+
+  if (!mqttClient.connected()) {
+    connectMqtt();
+  }
+
+  mqttClient.loop();
+
+  static unsigned long lastBlink = 0;
+  static bool state = false;
+
+  if (mode == "ON") {
+    digitalWrite(HEADLIGHT_PIN, HIGH);
+  }
+
+  else if (mode == "BLINK") {
+    if (millis() - lastBlink > 50) {
+      lastBlink = millis();
+      state = !state;
+      digitalWrite(HEADLIGHT_PIN, state);
+    }
+  }
+  else if(mode == "DESTROY"){
+    // todo xoa tat ca cai dat
+    resetFeature();
+
+  }
+}
+
+void resetFeature() {
+  Serial.println("RESET FEATURE START");
+  // tắt toàn bộ output
+  digitalWrite(HEADLIGHT_PIN, LOW);
+  // reset trạng thái
+  mode = "OFF";
+}
