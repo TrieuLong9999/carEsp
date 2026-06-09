@@ -1,191 +1,182 @@
 <!DOCTYPE html>
 <html lang="vi">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ESP32 Camera Viewer</title>
-
     <style>
-        * {
-            box-sizing: border-box;
-        }
+        * { box-sizing: border-box; }
+        body { margin: 0; background: #111; color: white; font-family: Arial, sans-serif; }
+        .header { background: #1e1e1e; padding: 15px; text-align: center; font-size: 22px; font-weight: bold; }
+        .container { padding: 20px; text-align: center; }
+        .status { margin-bottom: 15px; font-size: 16px; }
+        .info { margin-bottom: 15px; color: #aaa; }
 
-        body {
-            margin: 0;
-            background: #111;
-            color: white;
-            font-family: Arial, sans-serif;
-        }
-
-        .header {
-            background: #1e1e1e;
-            padding: 15px;
-            text-align: center;
-            font-size: 22px;
-            font-weight: bold;
-        }
-
-        .container {
-            padding: 20px;
-            text-align: center;
-        }
-
-        .status {
-            margin-bottom: 15px;
-            font-size: 16px;
-        }
-
-        .info {
-            margin-bottom: 15px;
-            color: #aaa;
-        }
-
-        #video {
+        /* CSS dùng chung cho cả img hoặc canvas */
+        #videoView {
             width: 90%;
             max-width: 1000px;
             border-radius: 10px;
             border: 2px solid #333;
             background: black;
+            display: inline-block;
         }
-
-        .stats {
-            margin-top: 15px;
-            color: #00ff88;
-        }
+        .stats { margin-top: 15px; color: #00ff88; }
     </style>
 </head>
-
 <body>
 
-<div class="header">
-    🎥 ESP32 Camera Stream
-</div>
+<div class="header">🎥 ESP32 Camera Stream</div>
 
 <div class="container">
+    <div class="status" id="status">Connecting...</div>
+    <div class="info">Stream ID: <b>1</b></div>
 
-    <div class="status" id="status">
-        Connecting...
-    </div>
-
-    <div class="info">
-        Stream ID: <b>1</b>
-    </div>
-
-    <img id="video">
+    <div id="videoContainer"></div>
 
     <div class="stats">
-        FPS: <span id="fps">0</span>
-        |
-        Frames: <span id="frames">0</span>
+        FPS: <span id="fps">0</span> | Frames: <span id="frames">0</span>
     </div>
-
 </div>
 
 <script>
-
     const STREAM_ID = "1";
-
-    const video = document.getElementById("video");
     const statusEl = document.getElementById("status");
     const fpsEl = document.getElementById("fps");
     const framesEl = document.getElementById("frames");
+    const videoContainer = document.getElementById("videoContainer");
 
     let socket = null;
-
     let frameCount = 0;
     let fps = 0;
+    let reconnectTimeout = null;
+    let isComponentDestroyed = false;
 
+    // --- KIỂM TRA MÔI TRƯỜNG ĐỂ CHỌN THÀNH PHẦN PHÙ HỢP ---
+    // iOS Safari quản lý bộ nhớ ảnh rất kém, ưu tiên dùng Canvas + ImageBitmap.
+    // Máy tính/Android dùng Canvas hoặc Img đều tốt, nhưng dùng Canvas sẽ đồng bộ hiệu năng hơn.
+    const useCanvas = typeof window.createImageBitmap === 'function';
+    let videoTarget = null;
+    let ctx = null;
+    let oldImageUrl = null; // Dùng riêng cho chế độ thẻ IMG phòng hờ
+
+    if (useCanvas) {
+        videoTarget = document.createElement('canvas');
+        videoTarget.id = "videoView";
+        ctx = videoTarget.getContext('2d');
+        videoContainer.appendChild(videoTarget);
+        console.log("Môi trường hỗ trợ hiệu năng cao: Khởi tạo CANVAS");
+    } else {
+        videoTarget = document.createElement('img');
+        videoTarget.id = "videoView";
+        videoContainer.appendChild(videoTarget);
+        console.log("Môi trường cũ: Khởi tạo IMG");
+    }
+
+    // --- HÀM KẾT NỐI WEBSOCKET ---
     function connectWebSocket() {
+        if (isComponentDestroyed) return;
+        if (reconnectTimeout) clearTimeout(reconnectTimeout);
 
-        const protocol =
-            location.protocol === "https:"
-                ? "wss"
-                : "ws";
+        const protocol = location.protocol === "https:" ? "wss" : "ws";
+        // Nếu chạy local file để test, hãy thay `location.host` bằng IP của ESP32 (VD: "119.168.1.5")
+        const host = location.host || "192.168.1.5";
+        const wsUrl = `${protocol}://${host}/video`;
 
-        const wsUrl =
-            `${protocol}://${location.host}/video`;
-
-        console.log("CONNECT:", wsUrl);
-
+        console.log("Đang kết nối tới:", wsUrl);
         socket = new WebSocket(wsUrl);
-
         socket.binaryType = "arraybuffer";
 
         socket.onopen = () => {
-
             console.log("WS OPEN");
-
-            statusEl.innerHTML =
-                "🟢 Connected";
-
+            statusEl.innerHTML = "🟢 Connected";
             socket.send(STREAM_ID);
         };
 
-        socket.onmessage = (event) => {
-
+        socket.onmessage = async (event) => {
             if (typeof event.data === "string") {
-
-                console.log("TEXT:", event.data);
+                // Nhận tín hiệu Ping hoặc lệnh Text từ Server thì bỏ qua hoặc log, không xử lý như ảnh
+                console.log("TXT:", event.data);
                 return;
             }
 
             frameCount++;
-
             framesEl.innerText = frameCount;
 
-            const blob = new Blob(
-                [event.data],
-                {
-                    type: "image/jpeg"
+            const blob = new Blob([event.data], { type: "image/jpeg" });
+
+            // XỬ LÝ THEO MÔI TRƯỜNG
+            if (useCanvas) {
+                // Cách tối ưu cho Máy tính mạnh và iOS (Không rò rỉ RAM)
+                try {
+                    const bitmap = await createImageBitmap(blob);
+                    if (videoTarget.width !== bitmap.width || videoTarget.height !== bitmap.height) {
+                        videoTarget.width = bitmap.width;
+                        videoTarget.height = bitmap.height;
+                    }
+                    ctx.drawImage(bitmap, 0, 0);
+                    bitmap.close(); // Giải phóng RAM ngay lập tức trên iOS
+                } catch (err) {
+                    console.error("Lỗi vẽ Bitmap:", err);
                 }
-            );
+            } else {
+                // Cách dự phòng cho các trình duyệt quá cũ dùng thẻ <img>
+                const newImageUrl = URL.createObjectURL(blob);
+                videoTarget.src = newImageUrl;
 
-            const imageUrl =
-                URL.createObjectURL(blob);
-
-            video.onload = () => {
-                URL.revokeObjectURL(imageUrl);
-            };
-
-            video.src = imageUrl;
+                // Thu hồi vùng nhớ của Khung hình trước đó (Xóa gối đầu để iOS không bị đầy RAM)
+                if (oldImageUrl) {
+                    URL.revokeObjectURL(oldImageUrl);
+                }
+                oldImageUrl = newImageUrl;
+            }
         };
 
-        socket.onclose = () => {
+        socket.onclose = (e) => {
+            console.log(`WS CLOSED (Code: ${e.code}). Đang thử kết nối lại sau 3s...`);
+            statusEl.innerHTML = "🔴 Disconnected - Reconnecting...";
 
-            console.log("WS CLOSED");
+            // Xóa bộ nhớ đệm cũ khi đóng kết nối để giải phóng RAM triệt để
+            if (oldImageUrl) {
+                URL.revokeObjectURL(oldImageUrl);
+                oldImageUrl = null;
+            }
 
-            statusEl.innerHTML =
-                "🔴 Disconnected - Reconnecting...";
-
-            setTimeout(
-                connectWebSocket,
-                3000
-            );
+            reconnectTimeout = setTimeout(connectWebSocket, 3000);
         };
 
         socket.onerror = (err) => {
-
-            console.error(err);
-
-            statusEl.innerHTML =
-                "⚠️ Error";
+            console.error("WS ERROR:", err);
+            statusEl.innerHTML = "⚠️ Error";
         };
     }
 
+    // --- TỐI ƯU CHO THIẾT BỊ DI ĐỘNG (Xử lý khi tắt màn hình / Đổi Tab) ---
+    // Trên máy tính đổi tab không sao, nhưng trên iPhone nếu tắt màn hình mà giữ kết nối ngầm
+    // Hệ điều hành sẽ ép ngắt (Kill) để tiết kiệm pin. Ta chủ động đóng trước và bật lại sau.
+    document.addEventListener("visibilitychange", () => {
+        if (document.hidden) {
+            console.log("Ứng dụng chạy ngầm: Chủ động ngắt kết nối để bảo vệ RAM/Pin");
+            if (socket) {
+                socket.close();
+            }
+            if (reconnectTimeout) clearTimeout(reconnectTimeout);
+        } else {
+            console.log("Ứng dụng hoạt động trở lại: Tái kết nối");
+            connectWebSocket();
+        }
+    });
+
+    // --- TÍNH FPS ĐỒNG BỘ ---
     setInterval(() => {
-
         fpsEl.innerText = fps;
-
         fps = frameCount;
         frameCount = 0;
-
     }, 1000);
 
+    // Bắt đầu chạy
     connectWebSocket();
-
 </script>
 
 </body>
-
 </html>
