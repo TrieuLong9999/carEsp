@@ -3,205 +3,226 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-    <title>ESP32 RC Dashboard</title>
+    <title>ESP32 RC MOBA UI</title>
 
     <style>
-        * { box-sizing: border-box; }
-
         body {
             margin: 0;
-            background: #111;
+            background: #0f0f0f;
             color: white;
             font-family: Arial;
+            overflow: hidden;
         }
 
-        .header {
+        /* ===== TOP STATUS ===== */
+        .top {
+            height: 40px;
             background: #1e1e1e;
-            padding: 12px;
-            text-align: center;
-            font-size: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
             font-weight: bold;
         }
 
-        .container {
-            text-align: center;
-            padding: 15px;
+        /* ===== VIDEO CENTER ===== */
+        .video-area {
+            height: calc(100vh - 200px);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: black;
         }
 
-        .status {
-            margin: 10px;
-            color: #aaa;
-        }
-
-        /* ===== VIDEO FIX CHÍNH ===== */
         #videoView {
             width: 95%;
-            max-width: 900px;
-
-            aspect-ratio: 16 / 9;   /* FIX KHÔNG MẤT KHUNG */
-
-            background: black;
-            border-radius: 10px;
+            height: 95%;
+            border-radius: 12px;
             border: 2px solid #333;
-
-            display: block;
-            margin: 0 auto;
             object-fit: cover;
         }
 
-        /* CONTROLS */
-        .controls {
-            margin-top: 15px;
+        /* ===== BOTTOM AREA ===== */
+        .bottom {
+            height: 160px;
+            display: flex;
+            justify-content: space-between;
+            padding: 10px;
+            background: #151515;
         }
 
-        .controls button {
-            margin: 5px;
-            padding: 10px 14px;
+        /* ===== LEFT CONTROL (FORWARD / BACKWARD) ===== */
+        .left-control {
+            width: 45%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .big-btn {
+            width: 90px;
+            height: 60px;
+            border-radius: 12px;
             border: none;
-            border-radius: 8px;
             background: #333;
             color: white;
-            cursor: pointer;
+            font-size: 18px;
         }
 
-        .controls button.active {
+        .big-btn:active {
             background: #00aa55;
         }
 
-        .stats {
-            margin-top: 10px;
-            color: #00ff88;
+        /* ===== RIGHT CONTROL (LEFT/RIGHT + LIGHT) ===== */
+        .right-control {
+            width: 45%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            gap: 10px;
         }
+
+        .row {
+            display: flex;
+            gap: 10px;
+        }
+
+        .small-btn {
+            width: 70px;
+            height: 50px;
+            border-radius: 10px;
+            border: none;
+            background: #333;
+            color: white;
+        }
+
+        .small-btn:active {
+            background: #00aa55;
+        }
+
+        .light-btn.active {
+            background: orange;
+        }
+
     </style>
 </head>
 
 <body>
 
-<div class="header">🚗 ESP32 RC + Camera Dashboard</div>
+<div class="top" id="status">🟢 CONNECTING...</div>
 
-<div class="container">
+<!-- ================= VIDEO ================= -->
+<div class="video-area">
+    <img id="videoView" />
+</div>
 
-    <div class="status" id="status">Connecting...</div>
+<!-- ================= BOTTOM CONTROLS ================= -->
+<div class="bottom">
 
-    <div id="videoContainer"></div>
+    <!-- LEFT: UP / DOWN -->
+    <div class="left-control">
 
-    <!-- CONTROL -->
-    <div class="controls">
-
-        <button id="headlightBtn" onclick="toggleHeadlight()">
-            🔆 Bật đèn
+        <button class="big-btn"
+                onpointerdown="sendCar('FWD')"
+                onpointerup="sendCar('STOP')">
+            ⬆
         </button>
 
-        <button id="blinkBtn">⚡ NHÁY HOLD</button>
-
-        <br/>
-
-        <button onclick="selectStream('1')">📷 Cam 1</button>
-        <button onclick="selectStream('2')">📷 Cam 2</button>
+        <button class="big-btn"
+                onpointerdown="sendCar('BWD')"
+                onpointerup="sendCar('STOP')">
+            ⬇
+        </button>
 
     </div>
 
-    <div class="stats">
-        FPS: <span id="fps">0</span> |
-        Frames: <span id="frames">0</span>
+    <!-- RIGHT: LEFT / RIGHT + LIGHT -->
+    <div class="right-control">
+
+        <div class="row">
+            <button class="small-btn"
+                    onpointerdown="sendCar('LEFT')"
+                    onpointerup="sendCar('STOP')">
+                ⬅
+            </button>
+
+            <button class="small-btn"
+                    onpointerdown="sendCar('RIGHT')"
+                    onpointerup="sendCar('STOP')">
+                ➡
+            </button>
+        </div>
+
+        <div class="row">
+            <button id="lightBtn"
+                    class="small-btn light-btn"
+                    onclick="toggleLight()">
+                💡
+            </button>
+
+            <button class="small-btn"
+                    onpointerdown="sendCar('BLINK_ON')"
+                    onpointerup="sendCar('BLINK_OFF')">
+                ⚡
+            </button>
+        </div>
+
     </div>
 
 </div>
 
 <script>
 
-    const DEVICE_ID = "ESP32CAR_001";
+    const DEVICE_ID = "ESP32CAM_001";
     let STREAM_ID = "1";
 
     let socket = null;
-    let frameCount = 0;
-    let fps = 0;
-    let headlightOn = false;
-    /* ================= VIDEO INIT ================= */
-    const videoContainer = document.getElementById("videoContainer");
-    const statusEl = document.getElementById("status");
-    const fpsEl = document.getElementById("fps");
-    const framesEl = document.getElementById("frames");
+    let lightOn = false;
 
-    let videoTarget = document.createElement("img");
-    videoTarget.id = "videoView";
-    videoContainer.appendChild(videoTarget);
-
-    let lastUrl = null;
-
-    /* ================= WS CONNECT ================= */
+    /* ================= WS ================= */
     function connectWS() {
 
-        const wsUrl = `ws://${location.host || "192.168.1.5"}/video`;
-
-        socket = new WebSocket(wsUrl);
+        socket = new WebSocket(`ws://${location.host || "192.168.1.5"}/video`);
         socket.binaryType = "arraybuffer";
 
         socket.onopen = () => {
-            statusEl.innerHTML = "🟢 Connected";
+            document.getElementById("status").innerText = "🟢 CONNECTED";
 
             send({
                 type: "STREAM_SELECT",
                 streamId: STREAM_ID,
-                deviceId: null,
+                deviceId: DEVICE_ID,
                 cmd: null,
                 data: null
             });
         };
 
-        socket.onmessage = (event) => {
+        socket.onmessage = (e) => {
+            if (typeof e.data === "string") return;
 
-            if (typeof event.data === "string") return;
-
-            frameCount++;
-            framesEl.innerText = frameCount;
-
-            const blob = new Blob([event.data], { type: "image/jpeg" });
-            const url = URL.createObjectURL(blob);
-
-            videoTarget.src = url;
-
-            // FIX MEMORY + LAYOUT STABLE
-            if (lastUrl) {
-                URL.revokeObjectURL(lastUrl);
-            }
-            lastUrl = url;
+            const blob = new Blob([e.data], {type:"image/jpeg"});
+            document.getElementById("videoView").src =
+                URL.createObjectURL(blob);
         };
 
         socket.onclose = () => {
-            statusEl.innerHTML = "🔴 Reconnecting...";
+            document.getElementById("status").innerText = "🔴 RECONNECT...";
             setTimeout(connectWS, 2000);
-        };
-
-        socket.onerror = () => {
-            statusEl.innerHTML = "⚠️ Error";
         };
     }
 
     /* ================= SEND ================= */
-    function send(obj) {
-        if (!socket || socket.readyState !== 1) return;
-        socket.send(JSON.stringify(obj));
+    function send(obj){
+        if(socket?.readyState === 1){
+            socket.send(JSON.stringify(obj));
+        }
     }
 
-    /* ================= STREAM ================= */
-    function selectStream(id) {
-        STREAM_ID = id;
-
+    function sendCar(cmd){
         send({
-            type: "STREAM_SELECT",
-            streamId: STREAM_ID,
-            deviceId: null,
-            cmd: null,
-            data: null
-        });
-    }
-
-    /* ================= CAR CONTROL ================= */
-    function sendCar(cmd) {
-
-        send({
-            type: "CAR_CONTROL",
+            type:"CAR_CONTROL",
             streamId: STREAM_ID,
             deviceId: DEVICE_ID,
             cmd: cmd,
@@ -209,65 +230,19 @@
         });
     }
 
-    /* ================= HOLD BLINK (FIXED) ================= */
-    const blinkBtn = document.getElementById("blinkBtn");
-    let blinking = false;
+    /* ================= LIGHT TOGGLE ================= */
+    function toggleLight(){
+        lightOn = !lightOn;
 
-    function startBlink() {
-        if (blinking) return;
-        blinking = true;
+        sendCar(lightOn ? "HEADLIGHT_ON" : "HEADLIGHT_OFF");
 
-        blinkBtn.classList.add("active");
-        sendCar("BLINK_ON");
+        const btn = document.getElementById("lightBtn");
+        btn.classList.toggle("active", lightOn);
     }
-
-    function stopBlink() {
-        if (!blinking) return;
-        blinking = false;
-
-        blinkBtn.classList.remove("active");
-        sendCar("BLINK_OFF");
-    }
-
-    /* POINTER EVENTS (BEST PRACTICE) */
-    blinkBtn.addEventListener("pointerdown", startBlink);
-    blinkBtn.addEventListener("pointerup", stopBlink);
-    blinkBtn.addEventListener("pointercancel", stopBlink);
-    blinkBtn.addEventListener("pointerleave", stopBlink);
-
-    /* ================= FPS ================= */
-    setInterval(() => {
-        fpsEl.innerText = fps;
-        fps = frameCount;
-        frameCount = 0;
-    }, 1000);
 
     /* ================= START ================= */
     connectWS();
-    function toggleHeadlight() {
 
-        headlightOn = !headlightOn;
-
-        if (headlightOn) {
-            sendCar("HEADLIGHT_ON");
-            updateHeadlightUI(true);
-        } else {
-            sendCar("HEADLIGHT_OFF");
-            updateHeadlightUI(false);
-        }
-    }
-    function updateHeadlightUI(state) {
-
-        const btn = document.getElementById("headlightBtn");
-
-        if (state) {
-            btn.innerText = "💡 Tắt đèn";
-            btn.style.background = "#ffb300";
-        } else {
-            btn.innerText = "🔆 Bật đèn";
-            btn.style.background = "#333";
-        }
-    }
 </script>
 
 </body>

@@ -190,7 +190,7 @@ public class VideoWebSocketHandler extends BinaryWebSocketHandler {
             // chỉ STOP khi thật sự hết viewer
             stopStreamIfNeeded(streamId);
         }
-        sentControlDevice(streamId, "DESTROY");
+        sentControlDevice(streamId,null, "DESTROY");
 
     }
 
@@ -211,21 +211,24 @@ public class VideoWebSocketHandler extends BinaryWebSocketHandler {
         String caseCmd = wsMessage.getCmd();
         String serialNumber = wsMessage.getDeviceId();
         switch (caseCmd){
-            case "HEADLIGHT_ON","BLINK_ON", "BLINK_OFF", "HEADLIGHT_OFF":
-                sentControlDevice(wsMessage.getStreamId(), wsMessage.getCmd());
+            case "HEADLIGHT_ON","BLINK_ON", "BLINK_OFF", "HEADLIGHT_OFF", "BWD", "STOP","FWD", "LEFT", "RIGHT":
+                sentControlDevice(wsMessage.getStreamId(), wsMessage.getDeviceId(), wsMessage.getCmd());
             break;
         }
     }
 
-    private void sentControlDevice(String streamId, String cmd) {
+    private void sentControlDevice(String streamId,String serialNumber, String cmd) {
 
-        DeviceInfo deviceInfo = deviceInfoRepository.findById(Long.parseLong(streamId)).orElse(null);
-        if(deviceInfo == null) return;
-        System.out.println("STOP STREAM " + streamId);
+        if (serialNumber == null || serialNumber.isEmpty()){
+            DeviceInfo deviceInfo = deviceInfoRepository.findById(Long.parseLong(streamId)).orElse(null);
+        if (deviceInfo == null) return;
+            serialNumber = deviceInfo.getSerialNumber();
+        }
+//    System.out.println("STOP STREAM " + streamId);
 
         String cmdQuery = "{\"cmd\":\""+cmd+"\"}";
         mqttService.publish(
-                "devices/" + deviceInfo.getSerialNumber() + "/control",
+                "devices/" + serialNumber + "/control",
                 cmdQuery
         );
 
