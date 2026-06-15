@@ -232,7 +232,7 @@ public class VideoWebSocketHandler extends BinaryWebSocketHandler {
                 cmdQuery
         );
 
-        streamSessions.remove(streamId);
+//        streamSessions.remove(streamId);
 
     }
 
